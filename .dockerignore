@@ -1,0 +1,17 @@
+.git
+数据
+data
+.tmp
+verification-output
+tests
+verify.ps1
+**/bin
+**/obj
+**/.git
+**/.vs
+**/.idea
+**/.vscode
+third-party/Obj2Tiles/Obj2Tiles.Test
+third-party/Obj2Tiles/Obj2Tiles.Library.Test
+third-party/Obj2Tiles/Obj2Tiles.Common
+third-party/Obj2Tiles/.github

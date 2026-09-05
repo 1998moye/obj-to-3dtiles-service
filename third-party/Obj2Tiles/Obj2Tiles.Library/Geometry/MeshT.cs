@@ -1,0 +1,1533 @@
+﻿using System.Diagnostics;
+using System.Globalization;
+using System.Numerics;
+using Obj2Tiles.Library.Algos;
+using Obj2Tiles.Library.Materials;
+using SixLabors.ImageSharp;
+using SixLabors.ImageSharp.Formats.Jpeg;
+using SixLabors.ImageSharp.Formats.Webp;
+using SixLabors.ImageSharp.PixelFormats;
+using SixLabors.ImageSharp.Processing;
+using Path = System.IO.Path;
+
+namespace Obj2Tiles.Library.Geometry;
+
+public class MeshT : IMesh
+{
+    private List<Vertex3> _vertices;
+    private List<Vertex2> _textureVertices;
+    private readonly List<FaceT> _faces;
+    private List<Material> _materials;
+    private List<RGB>? _vertexColors;
+
+    public IReadOnlyList<Vertex3> Vertices => _vertices;
+    public IReadOnlyList<Vertex2> TextureVertices => _textureVertices;
+    public IReadOnlyList<FaceT> Faces => _faces;
+    public IReadOnlyList<Material> Materials => _materials;
+    public IReadOnlyList<RGB>? VertexColors => _vertexColors;
+
+    public const string DefaultName = "Mesh";
+
+    public string Name { get; set; } = DefaultName;
+    public string DebugName { get; set; } = string.Empty;
+
+    public TexturesStrategy TexturesStrategy { get; set; }
+
+    /// <summary>
+    /// Multiplier applied to the atlas edge length during texture repacking.
+    /// 1.0 = full resolution, 0.5 = half, 0.25 = quarter, etc.
+    /// Values are clamped to (0, 1]. Only has effect with Repack or RepackCompressed.
+    /// </summary>
+    public float TextureDownscale { get; set; } = 1.0f;
+
+    /// <summary>
+    /// Maximum source texture resolution (per side, in pixels) used when repacking or compressing
+    /// atlases. Larger textures are downscaled to fit. 0 disables the cap.
+    /// </summary>
+    public int MaxTextureSize { get; set; } = 0;
+
+    /// <summary>
+    /// JPEG quality (1-100) used when saving compressed textures (RepackCompressed and Compress).
+    /// </summary>
+    public int TextureQuality { get; set; } = 75;
+
+    /// <summary>
+    /// Output image format for repacked/compressed textures. Webp emits the EXT_texture_webp glTF
+    /// extension and is typically 25-35% smaller than JPEG at comparable quality.
+    /// </summary>
+    public TextureFormat TextureFormat { get; set; } = TextureFormat.Jpeg;
+
+    public MeshT(IEnumerable<Vertex3> vertices, IEnumerable<Vertex2> textureVertices,
+        IEnumerable<FaceT> faces, IEnumerable<Material> materials, IEnumerable<RGB>? vertexColors = null)
+    {
+        _vertices = [.. vertices];
+        _textureVertices = [.. textureVertices];
+        _faces = [.. faces];
+        _materials = [.. materials];
+        _vertexColors = vertexColors != null ? [.. vertexColors] : null;
+    }
+
+    public int Split(IVertexUtils utils, double q, out IMesh left,
+        out IMesh right)
+    {
+        var leftVertices = new Dictionary<Vertex3, int>(_vertices.Count);
+        var rightVertices = new Dictionary<Vertex3, int>(_vertices.Count);
+
+        var leftFaces = new List<FaceT>(_faces.Count);
+        var rightFaces = new List<FaceT>(_faces.Count);
+
+        var leftTextureVertices = new Dictionary<Vertex2, int>(_textureVertices.Count);
+        var rightTextureVertices = new Dictionary<Vertex2, int>(_textureVertices.Count);
+
+        var hasColors = _vertexColors != null;
+        var leftColors = hasColors ? new List<RGB>(_vertices.Count) : null;
+        var rightColors = hasColors ? new List<RGB>(_vertices.Count) : null;
+
+        var count = 0;
+
+        for (var index = 0; index < _faces.Count; index++)
+        {
+            var face = _faces[index];
+
+            var vA = _vertices[face.IndexA];
+            var vB = _vertices[face.IndexB];
+            var vC = _vertices[face.IndexC];
+
+            var vtA = _textureVertices[face.TextureIndexA];
+            var vtB = _textureVertices[face.TextureIndexB];
+            var vtC = _textureVertices[face.TextureIndexC];
+
+            var aSide = utils.GetDimension(vA) < q;
+            var bSide = utils.GetDimension(vB) < q;
+            var cSide = utils.GetDimension(vC) < q;
+
+            if (aSide)
+            {
+                if (bSide)
+                {
+                    if (cSide)
+                    {
+                        // All on the left
+
+                        AddVertexWithColor(leftVertices, leftColors, vA, face.IndexA);
+                        AddVertexWithColor(leftVertices, leftColors, vB, face.IndexB);
+                        AddVertexWithColor(leftVertices, leftColors, vC, face.IndexC);
+
+                        var indexALeft = leftVertices[vA];
+                        var indexBLeft = leftVertices[vB];
+                        var indexCLeft = leftVertices[vC];
+
+                        var indexATextureLeft = leftTextureVertices!.AddIndex(vtA);
+                        var indexBTextureLeft = leftTextureVertices!.AddIndex(vtB);
+                        var indexCTextureLeft = leftTextureVertices!.AddIndex(vtC);
+
+                        leftFaces.Add(new FaceT(indexALeft, indexBLeft, indexCLeft,
+                            indexATextureLeft, indexBTextureLeft, indexCTextureLeft,
+                            face.MaterialIndex));
+                    }
+                    else
+                    {
+                        IntersectRight2DWithTexture(utils, q, face.IndexC, face.IndexA, face.IndexB,
+                            leftVertices,
+                            rightVertices,
+                            leftColors, rightColors,
+                            face.TextureIndexC, face.TextureIndexA, face.TextureIndexB,
+                            leftTextureVertices, rightTextureVertices, face.MaterialIndex, leftFaces, rightFaces
+                        );
+                        count++;
+                    }
+                }
+                else
+                {
+                    if (cSide)
+                    {
+                        IntersectRight2DWithTexture(utils, q, face.IndexB, face.IndexC, face.IndexA,
+                            leftVertices,
+                            rightVertices,
+                            leftColors, rightColors,
+                            face.TextureIndexB, face.TextureIndexC, face.TextureIndexA,
+                            leftTextureVertices, rightTextureVertices, face.MaterialIndex, leftFaces,
+                            rightFaces);
+                        count++;
+                    }
+                    else
+                    {
+                        IntersectLeft2DWithTexture(utils, q, face.IndexA, face.IndexB, face.IndexC,
+                            leftVertices,
+                            rightVertices,
+                            leftColors, rightColors,
+                            face.TextureIndexA, face.TextureIndexB, face.TextureIndexC,
+                            leftTextureVertices, rightTextureVertices, face.MaterialIndex, leftFaces,
+                            rightFaces);
+                        count++;
+                    }
+                }
+            }
+            else
+            {
+                if (bSide)
+                {
+                    if (cSide)
+                    {
+                        IntersectRight2DWithTexture(utils, q, face.IndexA, face.IndexB, face.IndexC,
+                            leftVertices,
+                            rightVertices,
+                            leftColors, rightColors,
+                            face.TextureIndexA, face.TextureIndexB, face.TextureIndexC,
+                            leftTextureVertices, rightTextureVertices, face.MaterialIndex, leftFaces,
+                            rightFaces);
+                        count++;
+                    }
+                    else
+                    {
+                        IntersectLeft2DWithTexture(utils, q, face.IndexB, face.IndexC, face.IndexA,
+                            leftVertices,
+                            rightVertices,
+                            leftColors, rightColors,
+                            face.TextureIndexB, face.TextureIndexC, face.TextureIndexA,
+                            leftTextureVertices, rightTextureVertices, face.MaterialIndex, leftFaces,
+                            rightFaces);
+                        count++;
+                    }
+                }
+                else
+                {
+                    if (cSide)
+                    {
+                        IntersectLeft2DWithTexture(utils, q, face.IndexC, face.IndexA, face.IndexB,
+                            leftVertices,
+                            rightVertices,
+                            leftColors, rightColors,
+                            face.TextureIndexC, face.TextureIndexA, face.TextureIndexB,
+                            leftTextureVertices, rightTextureVertices, face.MaterialIndex, leftFaces,
+                            rightFaces);
+                        count++;
+                    }
+                    else
+                    {
+                        // All on the right
+
+                        AddVertexWithColor(rightVertices, rightColors, vA, face.IndexA);
+                        AddVertexWithColor(rightVertices, rightColors, vB, face.IndexB);
+                        AddVertexWithColor(rightVertices, rightColors, vC, face.IndexC);
+
+                        var indexARight = rightVertices[vA];
+                        var indexBRight = rightVertices[vB];
+                        var indexCRight = rightVertices[vC];
+
+                        var indexATextureRight = rightTextureVertices!.AddIndex(vtA);
+                        var indexBTextureRight = rightTextureVertices!.AddIndex(vtB);
+                        var indexCTextureRight = rightTextureVertices!.AddIndex(vtC);
+
+                        rightFaces.Add(new FaceT(indexARight, indexBRight, indexCRight,
+                            indexATextureRight, indexBTextureRight, indexCTextureRight,
+                            face.MaterialIndex));
+                    }
+                }
+            }
+        }
+
+        var orderedLeftVertices = leftVertices.OrderBy(x => x.Value).Select(x => x.Key);
+        var orderedRightVertices = rightVertices.OrderBy(x => x.Value).Select(x => x.Key);
+        var rightMaterials = _materials.Select(mat => (Material)mat.Clone());
+
+        var orderedLeftTextureVertices = leftTextureVertices.OrderBy(x => x.Value).Select(x => x.Key);
+        var orderedRightTextureVertices = rightTextureVertices.OrderBy(x => x.Value).Select(x => x.Key);
+        var leftMaterials = _materials.Select(mat => (Material)mat.Clone());
+
+        left = new MeshT(orderedLeftVertices, orderedLeftTextureVertices, leftFaces, leftMaterials, leftColors)
+        {
+            Name = $"{Name}-{utils.Axis}L"
+        };
+        right = new MeshT(orderedRightVertices, orderedRightTextureVertices, rightFaces, rightMaterials, rightColors)
+        {
+            Name = $"{Name}-{utils.Axis}R"
+        };
+
+        return count;
+    }
+
+    /// <summary>
+    /// Adds a vertex to the dictionary and appends its color to the parallel list if the vertex is new.
+    /// </summary>
+    private void AddVertexWithColor(IDictionary<Vertex3, int> vertices, List<RGB>? colors,
+        Vertex3 vertex, int sourceIndex)
+    {
+        var prevCount = vertices.Count;
+        vertices.AddIndex(vertex);
+        if (colors != null && vertices.Count > prevCount)
+            colors.Add(_vertexColors![sourceIndex]);
+    }
+
+    /// <summary>
+    /// Adds an interpolated intersection vertex and its interpolated color.
+    /// </summary>
+    private static void AddIntersectionVertexWithColor(IDictionary<Vertex3, int> vertices, List<RGB>? colors,
+        Vertex3 vertex, RGB? color)
+    {
+        var prevCount = vertices.Count;
+        vertices.AddIndex(vertex);
+        if (colors != null && vertices.Count > prevCount)
+            colors.Add(color!);
+    }
+
+    private void IntersectLeft2DWithTexture(IVertexUtils utils, double q, int indexVL,
+        int indexVR1, int indexVR2,
+        IDictionary<Vertex3, int> leftVertices, IDictionary<Vertex3, int> rightVertices,
+        List<RGB>? leftColors, List<RGB>? rightColors,
+        int indexTextureVL, int indexTextureVR1, int indexTextureVR2,
+        IDictionary<Vertex2, int> leftTextureVertices, IDictionary<Vertex2, int> rightTextureVertices,
+        int materialIndex, ICollection<FaceT> leftFaces, ICollection<FaceT> rightFaces)
+    {
+        var vL = _vertices[indexVL];
+        var vR1 = _vertices[indexVR1];
+        var vR2 = _vertices[indexVR2];
+
+        var tVL = _textureVertices[indexTextureVL];
+        var tVR1 = _textureVertices[indexTextureVR1];
+        var tVR2 = _textureVertices[indexTextureVR2];
+
+        AddVertexWithColor(leftVertices, leftColors, vL, indexVL);
+        var indexVLLeft = leftVertices[vL];
+        var indexTextureVLLeft = leftTextureVertices.AddIndex(tVL);
+
+        if (Math.Abs(utils.GetDimension(vR1) - q) < Common.Epsilon &&
+            Math.Abs(utils.GetDimension(vR2) - q) < Common.Epsilon)
+        {
+            // Right Vertices are on the line
+
+            AddVertexWithColor(leftVertices, leftColors, vR1, indexVR1);
+            AddVertexWithColor(leftVertices, leftColors, vR2, indexVR2);
+            var indexVR1Left = leftVertices[vR1];
+            var indexVR2Left = leftVertices[vR2];
+
+            var indexTextureVR1Left = leftTextureVertices.AddIndex(tVR1);
+            var indexTextureVR2Left = leftTextureVertices.AddIndex(tVR2);
+
+            leftFaces.Add(new FaceT(indexVLLeft, indexVR1Left, indexVR2Left,
+                indexTextureVLLeft, indexTextureVR1Left, indexTextureVR2Left, materialIndex));
+
+            return;
+        }
+
+        AddVertexWithColor(rightVertices, rightColors, vR1, indexVR1);
+        AddVertexWithColor(rightVertices, rightColors, vR2, indexVR2);
+        var indexVR1Right = rightVertices[vR1];
+        var indexVR2Right = rightVertices[vR2];
+
+        // a on the left, b and c on the right
+
+        // Prima intersezione
+        var t1 = utils.CutEdge(vL, vR1, q);
+        RGB? t1Color = null;
+        if (_vertexColors != null)
+        {
+            var perc1Color = Common.GetIntersectionPerc(vL, vR1, t1);
+            t1Color = _vertexColors[indexVL].CutEdgePerc(_vertexColors[indexVR1], perc1Color);
+        }
+        AddIntersectionVertexWithColor(leftVertices, leftColors, t1, t1Color);
+        AddIntersectionVertexWithColor(rightVertices, rightColors, t1, t1Color);
+        var indexT1Left = leftVertices[t1];
+        var indexT1Right = rightVertices[t1];
+
+        // Seconda intersezione
+        var t2 = utils.CutEdge(vL, vR2, q);
+        RGB? t2Color = null;
+        if (_vertexColors != null)
+        {
+            var perc2Color = Common.GetIntersectionPerc(vL, vR2, t2);
+            t2Color = _vertexColors[indexVL].CutEdgePerc(_vertexColors[indexVR2], perc2Color);
+        }
+        AddIntersectionVertexWithColor(leftVertices, leftColors, t2, t2Color);
+        AddIntersectionVertexWithColor(rightVertices, rightColors, t2, t2Color);
+        var indexT2Left = leftVertices[t2];
+        var indexT2Right = rightVertices[t2];
+
+        // Split texture
+        var indexTextureVR1Right = rightTextureVertices.AddIndex(tVR1);
+        var indexTextureVR2Right = rightTextureVertices.AddIndex(tVR2);
+
+        var perc1 = Common.GetIntersectionPerc(vL, vR1, t1);
+
+        // Prima intersezione texture
+        var t1t = tVL.CutEdgePerc(tVR1, perc1);
+        var indexTextureT1Left = leftTextureVertices.AddIndex(t1t);
+        var indexTextureT1Right = rightTextureVertices.AddIndex(t1t);
+
+        var perc2 = Common.GetIntersectionPerc(vL, vR2, t2);
+
+        // Seconda intersezione texture
+        var t2t = tVL.CutEdgePerc(tVR2, perc2);
+        var indexTextureT2Left = leftTextureVertices.AddIndex(t2t);
+        var indexTextureT2Right = rightTextureVertices.AddIndex(t2t);
+
+        var lface = new FaceT(indexVLLeft, indexT1Left, indexT2Left,
+            indexTextureVLLeft, indexTextureT1Left, indexTextureT2Left, materialIndex);
+        leftFaces.Add(lface);
+
+        var rface1 = new FaceT(indexT1Right, indexVR1Right, indexVR2Right,
+            indexTextureT1Right, indexTextureVR1Right, indexTextureVR2Right, materialIndex);
+        rightFaces.Add(rface1);
+
+        var rface2 = new FaceT(indexT1Right, indexVR2Right, indexT2Right,
+            indexTextureT1Right, indexTextureVR2Right, indexTextureT2Right, materialIndex);
+        rightFaces.Add(rface2);
+    }
+
+    private void IntersectRight2DWithTexture(IVertexUtils utils, double q, int indexVR,
+        int indexVL1, int indexVL2,
+        IDictionary<Vertex3, int> leftVertices, IDictionary<Vertex3, int> rightVertices,
+        List<RGB>? leftColors, List<RGB>? rightColors,
+        int indexTextureVR, int indexTextureVL1, int indexTextureVL2,
+        IDictionary<Vertex2, int> leftTextureVertices, IDictionary<Vertex2, int> rightTextureVertices,
+        int materialIndex, ICollection<FaceT> leftFaces, ICollection<FaceT> rightFaces)
+    {
+        var vR = _vertices[indexVR];
+        var vL1 = _vertices[indexVL1];
+        var vL2 = _vertices[indexVL2];
+
+        var tVR = _textureVertices[indexTextureVR];
+        var tVL1 = _textureVertices[indexTextureVL1];
+        var tVL2 = _textureVertices[indexTextureVL2];
+
+        AddVertexWithColor(rightVertices, rightColors, vR, indexVR);
+        var indexVRRight = rightVertices[vR];
+        var indexTextureVRRight = rightTextureVertices.AddIndex(tVR);
+
+        if (Math.Abs(utils.GetDimension(vL1) - q) < Common.Epsilon &&
+            Math.Abs(utils.GetDimension(vL2) - q) < Common.Epsilon)
+        {
+            // Left Vertices are on the line
+
+            AddVertexWithColor(rightVertices, rightColors, vL1, indexVL1);
+            AddVertexWithColor(rightVertices, rightColors, vL2, indexVL2);
+            var indexVL1Right = rightVertices[vL1];
+            var indexVL2Right = rightVertices[vL2];
+
+            var indexTextureVL1Right = rightTextureVertices.AddIndex(tVL1);
+            var indexTextureVL2Right = rightTextureVertices.AddIndex(tVL2);
+
+            rightFaces.Add(new FaceT(indexVRRight, indexVL1Right, indexVL2Right,
+                indexTextureVRRight, indexTextureVL1Right, indexTextureVL2Right, materialIndex));
+
+            return;
+        }
+
+        AddVertexWithColor(leftVertices, leftColors, vL1, indexVL1);
+        AddVertexWithColor(leftVertices, leftColors, vL2, indexVL2);
+        var indexVL1Left = leftVertices[vL1];
+        var indexVL2Left = leftVertices[vL2];
+
+        // a on the right, b and c on the left
+
+        // Prima intersezione
+        var t1 = utils.CutEdge(vR, vL1, q);
+        RGB? t1Color = null;
+        if (_vertexColors != null)
+        {
+            var perc1Color = Common.GetIntersectionPerc(vR, vL1, t1);
+            t1Color = _vertexColors[indexVR].CutEdgePerc(_vertexColors[indexVL1], perc1Color);
+        }
+        AddIntersectionVertexWithColor(leftVertices, leftColors, t1, t1Color);
+        AddIntersectionVertexWithColor(rightVertices, rightColors, t1, t1Color);
+        var indexT1Left = leftVertices[t1];
+        var indexT1Right = rightVertices[t1];
+
+        // Seconda intersezione
+        var t2 = utils.CutEdge(vR, vL2, q);
+        RGB? t2Color = null;
+        if (_vertexColors != null)
+        {
+            var perc2Color = Common.GetIntersectionPerc(vR, vL2, t2);
+            t2Color = _vertexColors[indexVR].CutEdgePerc(_vertexColors[indexVL2], perc2Color);
+        }
+        AddIntersectionVertexWithColor(leftVertices, leftColors, t2, t2Color);
+        AddIntersectionVertexWithColor(rightVertices, rightColors, t2, t2Color);
+        var indexT2Left = leftVertices[t2];
+        var indexT2Right = rightVertices[t2];
+
+        // Split texture
+        var indexTextureVL1Left = leftTextureVertices.AddIndex(tVL1);
+        var indexTextureVL2Left = leftTextureVertices.AddIndex(tVL2);
+
+        var perc1 = Common.GetIntersectionPerc(vR, vL1, t1);
+
+        // Prima intersezione texture
+        var t1t = tVR.CutEdgePerc(tVL1, perc1);
+        var indexTextureT1Left = leftTextureVertices.AddIndex(t1t);
+        var indexTextureT1Right = rightTextureVertices.AddIndex(t1t);
+
+        var perc2 = Common.GetIntersectionPerc(vR, vL2, t2);
+
+        // Seconda intersezione texture
+        var t2t = tVR.CutEdgePerc(tVL2, perc2);
+        var indexTextureT2Left = leftTextureVertices.AddIndex(t2t);
+        var indexTextureT2Right = rightTextureVertices.AddIndex(t2t);
+
+        var rface = new FaceT(indexVRRight, indexT1Right, indexT2Right,
+            indexTextureVRRight, indexTextureT1Right, indexTextureT2Right, materialIndex);
+        rightFaces.Add(rface);
+
+        var lface1 = new FaceT(indexT2Left, indexVL1Left, indexVL2Left,
+            indexTextureT2Left, indexTextureVL1Left, indexTextureVL2Left, materialIndex);
+        leftFaces.Add(lface1);
+
+        var lface2 = new FaceT(indexT2Left, indexT1Left, indexVL1Left,
+            indexTextureT2Left, indexTextureT1Left, indexTextureVL1Left, materialIndex);
+        leftFaces.Add(lface2);
+    }
+
+    private void TrimTextures(string targetFolder)
+    {
+        var tasks = new List<Task>();
+
+        LoadTexturesCache();
+
+        var facesByMaterial = GetFacesByMaterial();
+
+        var newTextureVertices = new Dictionary<Vertex2, int>(_textureVertices.Count);
+
+        for (var m = 0; m < facesByMaterial.Count; m++)
+        {
+            var material = _materials[m];
+            var facesIndexes = facesByMaterial[m];
+
+            if (facesIndexes.Count == 0)
+                continue;
+
+            var edgesMapper = GetEdgesMapper(facesIndexes);
+            var facesMapper = GetFacesMapper(edgesMapper);
+            var clusters = GetFacesClusters(facesIndexes, facesMapper);
+
+            // Sort clusters by count (improves packing density, could be removed if we notice a bottleneck)
+            clusters.Sort((a, b) => b.Count.CompareTo(a.Count));
+
+            BinPackTextures(targetFolder, m, clusters, newTextureVertices, tasks);
+        }
+
+        _textureVertices = newTextureVertices.OrderBy(item => item.Value).Select(item => item.Key).ToList();
+
+        var allSaves = Task.WhenAll(tasks);
+        var saveSw = Stopwatch.StartNew();
+        long nextSaveProgressMs = 5000;
+        while (!allSaves.Wait(100))
+        {
+            if (saveSw.ElapsedMilliseconds >= nextSaveProgressMs)
+            {
+                Console.WriteLine($" -> [{DebugName}] Saving texture atlases... ({saveSw.Elapsed.TotalSeconds:F0}s)");
+                nextSaveProgressMs += 5000;
+            }
+        }
+    }
+
+    private void LoadTexturesCache()
+    {
+        Parallel.ForEach(_materials, material =>
+        {
+            if (!string.IsNullOrEmpty(material.Texture))
+                TexturesCache.GetTexture(material.Texture);
+            if (!string.IsNullOrEmpty(material.NormalMap))
+                TexturesCache.GetTexture(material.NormalMap);
+        });
+    }
+
+    private JpegEncoder CreateEncoder() => new JpegEncoder { Quality = Math.Clamp(TextureQuality, 1, 100) };
+
+    /// <summary>
+    /// Output file extension for a repacked atlas, honoring the selected texture format.
+    /// </summary>
+    private string AtlasExtension(string sourcePath)
+        => TextureFormat == TextureFormat.Webp ? ".webp"
+           : (TexturesStrategy == TexturesStrategy.Repack ? Path.GetExtension(sourcePath) : ".jpg");
+
+    /// <summary>
+    /// Saves a repacked atlas with the encoder matching the current strategy and format.
+    /// WebP is always encoded lossy at TextureQuality; for the classic formats Repack is lossless
+    /// (original format) and RepackCompressed is lossy JPEG.
+    /// </summary>
+    private void SaveAtlas(Image image, string path)
+    {
+        if (TextureFormat == TextureFormat.Webp)
+        {
+            // Always lossy: lossless WebP of an already-lossy source (e.g. a JPEG source atlas) can be
+            // larger than the source and defeat the purpose. Lossy WebP at TextureQuality is smaller
+            // than both PNG and JPEG at comparable quality.
+            image.SaveAsWebp(path, new WebpEncoder { FileFormat = WebpFileFormatType.Lossy, Quality = Math.Clamp(TextureQuality, 1, 100) });
+        }
+        else if (TexturesStrategy == TexturesStrategy.Repack)
+            image.Save(path);
+        else
+            image.SaveAsJpeg(path, CreateEncoder());
+    }
+
+    /// <summary>
+    /// Downscales an image in place so that neither side exceeds MaxTextureSize (when set), after
+    /// applying TextureDownscale. Used by the Compress strategy (e.g. the tileset root tile) so its
+    /// textures are not stored at full source resolution.
+    /// </summary>
+    private void ApplyTextureSizeLimit(Image image)
+    {
+        var s = Math.Clamp(TextureDownscale, float.Epsilon, 1.0f);
+        if (MaxTextureSize > 0)
+        {
+            int maxDim = Math.Max(image.Width, image.Height);
+            if (maxDim * s > MaxTextureSize)
+                s = Math.Clamp(MaxTextureSize / (float)maxDim, float.Epsilon, 1.0f);
+        }
+        if (s < 1.0f)
+        {
+            int w = Math.Max(1, (int)(image.Width * s));
+            int h = Math.Max(1, (int)(image.Height * s));
+            image.Mutate(x => x.Resize(w, h));
+        }
+    }
+
+    private void BinPackTextures(string targetFolder, int materialIndex, IReadOnlyList<List<int>> clusters,
+        IDictionary<Vertex2, int> newTextureVertices, ICollection<Task> tasks)
+    {
+        const int PADDING = 2; // <-- bleed ring
+
+        var packSw = Stopwatch.StartNew();
+        long nextProgressMs = 5000;
+
+        var material = _materials[materialIndex];
+
+        if (material.Texture == null && material.NormalMap == null) return;
+
+        var texture = material.Texture != null ? TexturesCache.GetTexture(material.Texture) : null;
+        var normalMap = material.NormalMap != null ? TexturesCache.GetTexture(material.NormalMap) : null;
+
+        int textureWidth = material.Texture != null ? texture!.Width : normalMap!.Width;
+        int textureHeight = material.Texture != null ? texture!.Height : normalMap!.Height;
+
+        float scale = Math.Clamp(TextureDownscale, float.Epsilon, 1.0f);
+
+        // Absolute cap: never repack an atlas from a source resolution larger than MaxTextureSize
+        // per side. This bounds the dominant LOD-0 texture cost. 0 disables the cap.
+        if (MaxTextureSize > 0)
+        {
+            int maxSrcDim = Math.Max(textureWidth, textureHeight);
+            if (maxSrcDim * scale > MaxTextureSize)
+                scale = Math.Clamp(MaxTextureSize / (float)maxSrcDim, float.Epsilon, 1.0f);
+        }
+
+        int effWidth  = Math.Max(1, (int)(textureWidth  * scale));
+        int effHeight = Math.Max(1, (int)(textureHeight * scale));
+
+        var clustersRects = clusters.Select(GetClusterRect).ToArray();
+
+        CalculateMaxMinAreaRect(clustersRects, effWidth, effHeight, PADDING, out var maxWidth, out var maxHeight,
+            out var textureArea);
+
+        var edgeLength = Math.Max(Common.NextPowerOfTwo((int)Math.Sqrt(textureArea)), 32);
+
+        if (edgeLength < maxWidth)
+            edgeLength = Common.NextPowerOfTwo((int)maxWidth);
+
+        if (edgeLength < maxHeight)
+            edgeLength = Common.NextPowerOfTwo((int)maxHeight);
+
+        // NOTE: We could enable rotations but it would be a bit more complex
+        var binPack = new MaxRectanglesBinPack(edgeLength, edgeLength, false);
+
+        var newTexture = material.Texture != null ? new Image<Rgba32>(edgeLength, edgeLength) : null;
+        var newNormalMap = material.NormalMap != null ? new Image<Rgba32>(edgeLength, edgeLength) : null;
+
+        string? textureFileName = null, normalMapFileName = null, newPathTexture = null, newPathNormalMap = null;
+        int count = 0;
+
+        for (int i = 0; i < clusters.Count; i++)
+        {
+            var cluster = clusters[i];
+            var clusterBoundary = clustersRects[i]; // [0..1] UV box
+
+            // Absolute bounds from cluster
+            double u0 = clusterBoundary.Left;
+            double v0 = clusterBoundary.Top;
+            double u1 = u0 + clusterBoundary.Width;
+            double v1 = v0 + clusterBoundary.Height;
+
+            // ---- UDIM tile localization ----
+            // Determine which UDIM tile this cluster belongs to.
+            int tileU = (int)Math.Floor(u0 + 1e-4);
+            int tileV = (int)Math.Floor(v0 + 1e-4);
+
+            // If a cluster spans multiple tiles, consider splitting by tile;
+            // for now we just clamp to this tile (assert/log to catch it).
+            if (Math.Floor(u1 - 1e-4) != tileU || Math.Floor(v1 - 1e-4) != tileV)
+            {
+                Debug.WriteLine($"[UDIM] Cluster spans multiple tiles: U[{u0},{u1}] V[{v0},{v1}]");
+            }
+
+            // Fractional (tile-local) UVs in [0,1]
+            double u0f = Math.Clamp(u0 - tileU, 0.0, 1.0);
+            double v0f = Math.Clamp(v0 - tileV, 0.0, 1.0);
+            double u1f = Math.Clamp(u1 - tileU, 0.0, 1.0);
+            double v1f = Math.Clamp(v1 - tileV, 0.0, 1.0);
+
+            // ---- Pixel-center crop in the source tile ----
+            int sx = Math.Clamp((int)Math.Floor(u0f * textureWidth + 0.5), 0, textureWidth - 1);
+            int ex = Math.Clamp((int)Math.Ceiling(u1f * textureWidth - 0.5), 1, textureWidth);
+            int sb = Math.Clamp((int)Math.Floor(v0f * textureHeight + 0.5), 0, textureHeight - 1);
+            int eb = Math.Clamp((int)Math.Ceiling(v1f * textureHeight - 0.5), 1, textureHeight);
+
+            int sw = Math.Max(1, ex - sx);
+            int sh = Math.Max(1, eb - sb);
+
+            // ImageSharp uses top-left origin; OBJ UVs are bottom-left → convert Y
+            int syTL = Math.Clamp(textureHeight - eb, 0, textureHeight - sh);
+            var srcRect = new Rectangle(sx, syTL, sw, sh);
+
+            // Atlas-space dimensions (may be smaller than source when TextureDownscale < 1)
+            int scaledSw = Math.Max(1, (int)Math.Round(sw * scale));
+            int scaledSh = Math.Max(1, (int)Math.Round(sh * scale));
+
+            // ---------- reserve atlas space WITH padding ----------
+            var packRect = binPack.Insert(scaledSw + 2 * PADDING, scaledSh + 2 * PADDING,
+                                          FreeRectangleChoiceHeuristic.RectangleBestAreaFit);
+
+            // If we ran out of room: save current atlas, start a new one (keeps your behavior)
+            if (packRect.Width == 0)
+            {
+                textureFileName = material.Texture != null
+                    ? $"{Name}-texture-diffuse-{materialIndex}-{material.Name}{AtlasExtension(material.Texture)}" : null;
+                normalMapFileName = material.NormalMap != null
+                    ? $"{Name}-texture-normal-{materialIndex}-{material.Name}{AtlasExtension(material.NormalMap)}" : null;
+
+                if (material.Texture != null) {
+                    newPathTexture = Path.Combine(targetFolder, textureFileName!);
+                    SaveAtlas(newTexture!, newPathTexture); newTexture!.Dispose();
+                }
+
+                if (material.NormalMap != null) {
+                    newPathNormalMap = Path.Combine(targetFolder, normalMapFileName!);
+                    SaveAtlas(newNormalMap!, newPathNormalMap);
+                    newNormalMap!.Dispose();
+                }
+
+                // fresh atlas
+                newTexture = material.Texture != null ? new Image<Rgba32>(edgeLength, edgeLength) : null;
+                newNormalMap = material.NormalMap != null ? new Image<Rgba32>(edgeLength, edgeLength) : null;
+                binPack = new MaxRectanglesBinPack(edgeLength, edgeLength, false);
+                material.Texture = textureFileName;
+                material.NormalMap = normalMapFileName;
+
+                // avoid name collision, clone material
+                count++;
+                material = new Material(material.Name + "-" + count, textureFileName, normalMapFileName,
+                    material.AmbientColor, material.DiffuseColor, material.SpecularColor,
+                    material.SpecularExponent, material.Dissolve, material.IlluminationModel);
+                _materials.Add(material);
+                materialIndex = _materials.Count - 1;
+
+                // try again
+                packRect = binPack.Insert(scaledSw + 2 * PADDING, scaledSh + 2 * PADDING,
+                                          FreeRectangleChoiceHeuristic.RectangleBestAreaFit);
+                if (packRect.Width == 0)
+                    throw new Exception($"Packing failed for {scaledSw}x{scaledSh} into {edgeLength}x{edgeLength} (occ {binPack.Occupancy()})");
+            }
+
+            int destInnerX = packRect.X + PADDING;
+            int destInnerY = packRect.Y + PADDING;
+            int destOuterX = destInnerX - PADDING;
+            int destOuterY = destInnerY - PADDING;
+
+
+            if (material.Texture != null)
+            {
+                using var block = BuildPaddedBlock(texture!, srcRect, PADDING, scaledSw, scaledSh);
+                newTexture!.Mutate(c => c.DrawImage(block, new Point(destOuterX, destOuterY), 1f));
+            }
+            if (material.NormalMap != null)
+            {
+                using var blockN = BuildPaddedBlock(normalMap!, srcRect, PADDING, scaledSw, scaledSh);
+                newNormalMap!.Mutate(c => c.DrawImage(blockN, new Point(destOuterX, destOuterY), 1f));
+            }
+
+            double atlasU0 = destInnerX / (double)edgeLength;
+            double atlasV0 = (edgeLength - (destInnerY + scaledSh)) / (double)edgeLength;
+            double innerUw = scaledSw / (double)edgeLength;
+            double innerVh = scaledSh / (double)edgeLength;
+
+            Vertex2 MapUV(double rx, double ry) =>
+                new((float)Math.Clamp(atlasU0 + rx * innerUw, 0, 1),
+                    (float)Math.Clamp(atlasV0 + ry * innerVh, 0, 1));
+
+            for (int idx = 0; idx < cluster.Count; idx++)
+            {
+                var faceIndex = cluster[idx];
+                var face = _faces[faceIndex];
+
+                var vtA = _textureVertices[face.TextureIndexA];
+                var vtB = _textureVertices[face.TextureIndexB];
+                var vtC = _textureVertices[face.TextureIndexC];
+
+                // chart-local [0..1] (avoid mixing full-texture scales)
+                double rxA = (vtA.X - u0) / Math.Max(u1 - u0, double.Epsilon);
+                double ryA = (vtA.Y - v0) / Math.Max(v1 - v0, double.Epsilon);
+                double rxB = (vtB.X - u0) / Math.Max(u1 - u0, double.Epsilon);
+                double ryB = (vtB.Y - v0) / Math.Max(v1 - v0, double.Epsilon);
+                double rxC = (vtC.X - u0) / Math.Max(u1 - u0, double.Epsilon);
+                double ryC = (vtC.Y - v0) / Math.Max(v1 - v0, double.Epsilon);
+
+                var newVtA = MapUV(rxA, ryA);
+                var newVtB = MapUV(rxB, ryB);
+                var newVtC = MapUV(rxC, ryC);
+
+                var newIndexVtA = newTextureVertices.AddIndex(newVtA);
+                var newIndexVtB = newTextureVertices.AddIndex(newVtB);
+                var newIndexVtC = newTextureVertices.AddIndex(newVtC);
+
+                face.TextureIndexA = newIndexVtA;
+                face.TextureIndexB = newIndexVtB;
+                face.TextureIndexC = newIndexVtC;
+                face.MaterialIndex = materialIndex;
+            }
+
+            if (packSw.ElapsedMilliseconds >= nextProgressMs)
+            {
+                Console.WriteLine($" -> [{DebugName}] Repacking texture '{_materials[materialIndex].Name}': {i + 1}/{clusters.Count} ({(i + 1) * 100 / clusters.Count}%) clusters ({packSw.Elapsed.TotalSeconds:F0}s)...");
+                nextProgressMs += 5000;
+            }
+        }
+
+        // ---------- saving ----------
+        if (material.Texture != null)
+        {
+            textureFileName = $"{Name}-texture-diffuse-{materialIndex}-{material.Name}{AtlasExtension(material.Texture)}";
+            newPathTexture = Path.Combine(targetFolder, textureFileName);
+        }
+
+        if (material.NormalMap != null)
+        {
+            normalMapFileName = $"{Name}-texture-normal-{materialIndex}-{material.Name}{AtlasExtension(material.NormalMap)}";
+            newPathNormalMap = Path.Combine(targetFolder, normalMapFileName);
+        }
+
+        var saveTaskTexture = new Task(t =>
+        {
+            var tx = (Image<Rgba32>)t!;
+            SaveAtlas(tx, newPathTexture!);
+            tx.Dispose();
+        }, newTexture, TaskCreationOptions.LongRunning);
+
+        var saveTaskNormalMap = new Task(t =>
+        {
+            var tx = (Image<Rgba32>)t!;
+            SaveAtlas(tx, newPathNormalMap!);
+            tx.Dispose();
+        }, newNormalMap, TaskCreationOptions.LongRunning);
+
+        if (material.Texture != null) {
+            tasks.Add(saveTaskTexture);
+            saveTaskTexture.Start();
+            material.Texture = textureFileName;
+
+        }
+
+        if (material.NormalMap != null) {
+            tasks.Add(saveTaskNormalMap);
+            saveTaskNormalMap.Start();
+            material.NormalMap = normalMapFileName;
+        }
+    }
+
+    // Adds bleed padding to each chart when estimating total area and max dims.
+    private void CalculateMaxMinAreaRect(
+        RectangleF[] clustersRects,
+        int textureWidth,
+        int textureHeight,
+        int paddingPx,                        // <-- NEW
+        out double maxWidth,                  // pixels (already padded)
+        out double maxHeight,                 // pixels (already padded)
+        out double textureArea)               // pixels^2 (sum of padded chart areas)
+    {
+        long areaPx = 0;
+        int maxW = 0;
+        int maxH = 0;
+
+        for (int index = 0; index < clustersRects.Length; index++)
+        {
+            var rect = clustersRects[index];
+
+            // Chart size in pixels from UV fraction
+            int w = Math.Max(1, (int)Math.Ceiling(rect.Width * textureWidth));
+            int h = Math.Max(1, (int)Math.Ceiling(rect.Height * textureHeight));
+
+            // Add padding on both sides
+            int wPad = Math.Max(1, w + 2 * paddingPx);
+            int hPad = Math.Max(1, h + 2 * paddingPx);
+
+            areaPx += (long)wPad * (long)hPad;
+            if (wPad > maxW) maxW = wPad;
+            if (hPad > maxH) maxH = hPad;
+        }
+
+        maxWidth = maxW;          // already in pixels (no further multiply)
+        maxHeight = maxH;         // already in pixels (no further multiply)
+        textureArea = areaPx;     // in pixels^2
+    }
+
+
+    /// <summary>
+    /// Calculates the bounding box of a set of points.
+    /// </summary>
+    /// <param name="cluster"></param>
+    /// <returns></returns>
+    private RectangleF GetClusterRect(IReadOnlyList<int> cluster)
+    {
+        double maxX = double.MinValue, maxY = double.MinValue;
+        double minX = double.MaxValue, minY = double.MaxValue;
+
+        for (var n = 0; n < cluster.Count; n++)
+        {
+            var face = _faces[cluster[n]];
+
+            var vtA = _textureVertices[face.TextureIndexA];
+            var vtB = _textureVertices[face.TextureIndexB];
+            var vtC = _textureVertices[face.TextureIndexC];
+
+            maxX = Math.Max(Math.Max(Math.Max(maxX, vtC.X), vtB.X), vtA.X);
+            maxY = Math.Max(Math.Max(Math.Max(maxY, vtC.Y), vtB.Y), vtA.Y);
+
+            minX = Math.Min(Math.Min(Math.Min(minX, vtC.X), vtB.X), vtA.X);
+            minY = Math.Min(Math.Min(Math.Min(minY, vtC.Y), vtB.Y), vtA.Y);
+        }
+
+        return new RectangleF((float)minX, (float)minY, (float)(maxX - minX), (float)(maxY - minY));
+    }
+
+    private double GetTextureArea(IReadOnlyList<int> facesIndexes)
+    {
+        double area = 0;
+
+        for (var index = 0; index < facesIndexes.Count; index++)
+        {
+            var faceIndex = facesIndexes[index];
+
+            var vtA = _textureVertices[_faces[faceIndex].TextureIndexA];
+            var vtB = _textureVertices[_faces[faceIndex].TextureIndexB];
+            var vtC = _textureVertices[_faces[faceIndex].TextureIndexC];
+
+            area += Common.Area(vtA, vtB, vtC);
+        }
+
+        return area;
+    }
+
+    private static List<List<int>> GetFacesClusters(IEnumerable<int> facesIndexes,
+        IReadOnlyDictionary<int, List<int>> facesMapper)
+    {
+
+        var clusters = new List<List<int>>();
+        var remainingFacesIndexes = new HashSet<int>(facesIndexes);
+
+        var first = remainingFacesIndexes.First();
+        var currentCluster = new List<int> { first };
+        var currentClusterCache = new HashSet<int> { first };
+        remainingFacesIndexes.Remove(first);
+
+        var lastRemainingFacesCount = remainingFacesIndexes.Count;
+
+        while (remainingFacesIndexes.Count > 0)
+        {
+            var cnt = currentCluster.Count;
+
+            for (var index = 0; index < currentCluster.Count; index++)
+            {
+                var faceIndex = currentCluster[index];
+
+                if (!facesMapper.TryGetValue(faceIndex, out var connectedFaces))
+                    continue;
+
+                for (var i = 0; i < connectedFaces.Count; i++)
+                {
+                    var connectedFace = connectedFaces[i];
+                    if (currentClusterCache.Contains(connectedFace)) continue;
+
+                    currentCluster.Add(connectedFace);
+                    currentClusterCache.Add(connectedFace);
+                    remainingFacesIndexes.Remove(connectedFace);
+                }
+            }
+
+            // No new face was added
+            if (cnt == currentCluster.Count)
+            {
+                // Add the cluster
+                clusters.Add(currentCluster);
+
+                // If no more faces, exit
+                if (remainingFacesIndexes.Count == 0) break;
+
+                // Let's continue with the next cluster
+                var next = remainingFacesIndexes.First();
+                currentCluster = [next];
+                currentClusterCache = [next];
+                remainingFacesIndexes.Remove(next);
+            }
+
+            if (lastRemainingFacesCount == remainingFacesIndexes.Count)
+            {
+                Debug.WriteLine("Discarding " + remainingFacesIndexes.Count + " faces.");
+                break;
+            }
+
+            lastRemainingFacesCount = remainingFacesIndexes.Count;
+        }
+
+        // Add the cluster
+        clusters.Add(currentCluster);
+        return clusters;
+    }
+
+    private static Dictionary<int, List<int>> GetFacesMapper(Dictionary<Edge, List<int>> edgesMapper)
+    {
+        var facesMapper = new Dictionary<int, List<int>>();
+
+        foreach (var edge in edgesMapper)
+        {
+            for (var i = 0; i < edge.Value.Count; i++)
+            {
+                var faceIndex = edge.Value[i];
+                if (!facesMapper.ContainsKey(faceIndex))
+                    facesMapper.Add(faceIndex, []);
+
+                for (var index = 0; index < edge.Value.Count; index++)
+                {
+                    var f = edge.Value[index];
+                    if (f != faceIndex)
+                        facesMapper[faceIndex].Add(f);
+                }
+            }
+        }
+
+        return facesMapper;
+    }
+
+    private Dictionary<Edge, List<int>> GetEdgesMapper(IReadOnlyList<int> facesIndexes)
+    {
+        var edgesMapper = new Dictionary<Edge, List<int>>();
+        edgesMapper.EnsureCapacity(facesIndexes.Count * 3);
+
+        for (var idx = 0; idx < facesIndexes.Count; idx++)
+        {
+            var faceIndex = facesIndexes[idx];
+            var f = _faces[faceIndex];
+
+            var e1 = new Edge(f.TextureIndexA, f.TextureIndexB);
+            var e2 = new Edge(f.TextureIndexB, f.TextureIndexC);
+            var e3 = new Edge(f.TextureIndexA, f.TextureIndexC);
+
+            if (!edgesMapper.ContainsKey(e1))
+                edgesMapper.Add(e1, []);
+
+            if (!edgesMapper.ContainsKey(e2))
+                edgesMapper.Add(e2, []);
+
+            if (!edgesMapper.ContainsKey(e3))
+                edgesMapper.Add(e3, []);
+
+            edgesMapper[e1].Add(faceIndex);
+            edgesMapper[e2].Add(faceIndex);
+            edgesMapper[e3].Add(faceIndex);
+        }
+
+        return edgesMapper;
+    }
+
+    private List<List<int>> GetFacesByMaterial()
+    {
+        var res = _materials.Select(_ => new List<int>()).ToList();
+
+        for (var i = 0; i < _faces.Count; i++)
+        {
+            var f = _faces[i];
+
+            res[f.MaterialIndex].Add(i);
+        }
+
+        return res;
+    }
+
+    #region Utils
+
+    public Box3 Bounds
+    {
+        get
+        {
+            var minX = double.MaxValue;
+            var minY = double.MaxValue;
+            var minZ = double.MaxValue;
+
+            var maxX = double.MinValue;
+            var maxY = double.MinValue;
+            var maxZ = double.MinValue;
+
+            for (var index = 0; index < _vertices.Count; index++)
+            {
+                var v = _vertices[index];
+                minX = minX < v.X ? minX : v.X;
+                minY = minY < v.Y ? minY : v.Y;
+                minZ = minZ < v.Z ? minZ : v.Z;
+
+                maxX = v.X > maxX ? v.X : maxX;
+                maxY = v.Y > maxY ? v.Y : maxY;
+                maxZ = v.Z > maxZ ? v.Z : maxZ;
+            }
+
+            return new Box3(minX, minY, minZ, maxX, maxY, maxZ);
+        }
+    }
+
+    public Vertex3 GetAverageOrientation()
+    {
+        double x = 0;
+        double y = 0;
+        double z = 0;
+
+        for (var index = 0; index < _faces.Count; index++)
+        {
+            var f = _faces[index];
+            var v1 = _vertices[f.IndexA];
+            var v2 = _vertices[f.IndexB];
+            var v3 = _vertices[f.IndexC];
+
+            var orientation = Common.Orientation(v1, v2, v3);
+
+            x += orientation.X;
+            y += orientation.Y;
+            z += orientation.Z;
+        }
+
+        x /= _faces.Count;
+        y /= _faces.Count;
+        z /= _faces.Count;
+
+        // Calculate x, y and z angles
+        var xAngle = Math.Atan2(y, z);
+        var yAngle = Math.Atan2(x, z);
+        var zAngle = Math.Atan2(y, x);
+
+        return new Vertex3(xAngle, yAngle, zAngle);
+    }
+
+    public Vertex3 GetVertexBaricenter()
+    {
+        var x = 0.0;
+        var y = 0.0;
+        var z = 0.0;
+
+        for (var index = 0; index < _vertices.Count; index++)
+        {
+            var v = _vertices[index];
+            x += v.X;
+            y += v.Y;
+            z += v.Z;
+        }
+
+        x /= _vertices.Count;
+        y /= _vertices.Count;
+        z /= _vertices.Count;
+
+        return new Vertex3(x, y, z);
+    }
+
+    public Vertex3 GetVertexMedian()
+    {
+        var count = _vertices.Count;
+        if (count == 0)
+            return new Vertex3(0, 0, 0);
+
+        var xs = new double[count];
+        var ys = new double[count];
+        var zs = new double[count];
+
+        for (var i = 0; i < count; i++)
+        {
+            xs[i] = _vertices[i].X;
+            ys[i] = _vertices[i].Y;
+            zs[i] = _vertices[i].Z;
+        }
+
+        Array.Sort(xs);
+        Array.Sort(ys);
+        Array.Sort(zs);
+
+        var mid = count / 2;
+        return new Vertex3(xs[mid], ys[mid], zs[mid]);
+    }
+
+    public void WriteObj(string path, bool removeUnused = true)
+    {
+        var hasTextures = _materials.Count > 0 && _textureVertices.Count > 0;
+        //Console.WriteLine($" -> '{Name}': {(hasTextures ? $"{_materials.Count} mat(s), {_textureVertices.Count} UVs [{TexturesStrategy}]" : "no textures")}");
+        if (!hasTextures)
+            _WriteObjWithoutTexture(path, removeUnused);
+        else
+            _WriteObjWithTexture(path, removeUnused);
+    }
+
+    private void RemoveUnusedVertices()
+    {
+        var newVertexes = new Dictionary<Vertex3, int>(_vertices.Count);
+        var newColors = _vertexColors != null ? new List<RGB>(_vertices.Count) : null;
+
+        for (var f = 0; f < _faces.Count; f++)
+        {
+            var face = _faces[f];
+
+            var vA = _vertices[face.IndexA];
+            var vB = _vertices[face.IndexB];
+            var vC = _vertices[face.IndexC];
+
+            if (!newVertexes.TryGetValue(vA, out var newVA))
+            {
+                newVA = newVertexes.AddIndex(vA);
+                if (newColors != null)
+                    newColors.Add(_vertexColors![face.IndexA]);
+            }
+
+            face.IndexA = newVA;
+
+            if (!newVertexes.TryGetValue(vB, out var newVB))
+            {
+                newVB = newVertexes.AddIndex(vB);
+                if (newColors != null)
+                    newColors.Add(_vertexColors![face.IndexB]);
+            }
+
+            face.IndexB = newVB;
+
+            if (!newVertexes.TryGetValue(vC, out var newVC))
+            {
+                newVC = newVertexes.AddIndex(vC);
+                if (newColors != null)
+                    newColors.Add(_vertexColors![face.IndexC]);
+            }
+
+            face.IndexC = newVC;
+        }
+
+        _vertices = newVertexes.Keys.ToList();
+        _vertexColors = newColors;
+    }
+
+    private void RemoveUnusedVerticesAndUvs()
+    {
+        var newVertexes = new Dictionary<Vertex3, int>(_vertices.Count);
+        var newUvs = new Dictionary<Vertex2, int>(_textureVertices.Count);
+        var newMaterials = new Dictionary<Material, int>(_materials.Count);
+        var newColors = _vertexColors != null ? new List<RGB>(_vertices.Count) : null;
+
+        for (var f = 0; f < _faces.Count; f++)
+        {
+            var face = _faces[f];
+
+            // Vertices
+
+            var vA = _vertices[face.IndexA];
+            var vB = _vertices[face.IndexB];
+            var vC = _vertices[face.IndexC];
+
+            if (!newVertexes.TryGetValue(vA, out var newVA))
+            {
+                newVA = newVertexes.AddIndex(vA);
+                if (newColors != null)
+                    newColors.Add(_vertexColors![face.IndexA]);
+            }
+
+            face.IndexA = newVA;
+
+            if (!newVertexes.TryGetValue(vB, out var newVB))
+            {
+                newVB = newVertexes.AddIndex(vB);
+                if (newColors != null)
+                    newColors.Add(_vertexColors![face.IndexB]);
+            }
+
+            face.IndexB = newVB;
+
+            if (!newVertexes.TryGetValue(vC, out var newVC))
+            {
+                newVC = newVertexes.AddIndex(vC);
+                if (newColors != null)
+                    newColors.Add(_vertexColors![face.IndexC]);
+            }
+
+            face.IndexC = newVC;
+
+            // Texture vertices
+
+            var uvA = _textureVertices[face.TextureIndexA];
+            var uvB = _textureVertices[face.TextureIndexB];
+            var uvC = _textureVertices[face.TextureIndexC];
+
+            if (!newUvs.TryGetValue(uvA, out var newUvA))
+                newUvA = newUvs.AddIndex(uvA);
+
+            face.TextureIndexA = newUvA;
+
+            if (!newUvs.TryGetValue(uvB, out var newUvB))
+                newUvB = newUvs.AddIndex(uvB);
+
+            face.TextureIndexB = newUvB;
+
+            if (!newUvs.TryGetValue(uvC, out var newUvC))
+                newUvC = newUvs.AddIndex(uvC);
+
+            face.TextureIndexC = newUvC;
+
+            // Materials
+
+            var material = _materials[face.MaterialIndex];
+
+            if (!newMaterials.TryGetValue(material, out var newMaterial))
+                newMaterial = newMaterials.AddIndex(material);
+
+            face.MaterialIndex = newMaterial;
+        }
+
+        _vertices = newVertexes.Keys.ToList();
+        _textureVertices = newUvs.Keys.ToList();
+        _materials = newMaterials.Keys.ToList();
+        _vertexColors = newColors;
+    }
+
+    // Crop the source rect, resize to (scaledW x scaledH), then add a padding-wide bleed ring by
+    // edge-pixel repetition. Resizing before padding ensures the interior occupies exactly
+    // [padding, padding+scaledW) in the returned block regardless of the scale factor.
+    private static Image<Rgba32> BuildPaddedBlock(Image<Rgba32> src, Rectangle srcRect, int padding, int scaledW, int scaledH)
+    {
+        int sx = Math.Clamp(srcRect.X, 0, Math.Max(0, src.Width - 1));
+        int sy = Math.Clamp(srcRect.Y, 0, Math.Max(0, src.Height - 1));
+        int sw = Math.Clamp(srcRect.Width, 1, src.Width - sx);
+        int sh = Math.Clamp(srcRect.Height, 1, src.Height - sy);
+
+        // Step 1: crop the interior at full source resolution.
+        using var interior = new Image<Rgba32>(sw, sh);
+        src.ProcessPixelRows(interior, (srcAcc, intAcc) =>
+        {
+            for (int y = 0; y < sh; y++)
+            {
+                var srcRow = srcAcc.GetRowSpan(sy + y);
+                var intRow = intAcc.GetRowSpan(y);
+                for (int x = 0; x < sw; x++)
+                    intRow[x] = srcRow[sx + x];
+            }
+        });
+
+        // Step 2: resize the interior to the target atlas dimensions (skipped when 1:1).
+        if (scaledW != sw || scaledH != sh)
+            interior.Mutate(ctx => ctx.Resize(scaledW, scaledH));
+
+        // Step 3: add the bleed ring from the (now resized) interior edge pixels.
+        var block = new Image<Rgba32>(scaledW + 2 * padding, scaledH + 2 * padding);
+        interior.ProcessPixelRows(block, (intAcc, blockAcc) =>
+        {
+            for (int destY = 0; destY < blockAcc.Height; destY++)
+            {
+                int intY = Math.Clamp(destY - padding, 0, scaledH - 1);
+                var intRow = intAcc.GetRowSpan(intY);
+                var destRow = blockAcc.GetRowSpan(destY);
+                for (int destX = 0; destX < blockAcc.Width; destX++)
+                {
+                    int intX = Math.Clamp(destX - padding, 0, scaledW - 1);
+                    destRow[destX] = intRow[intX];
+                }
+            }
+        });
+        return block;
+    }
+
+
+    private void _WriteObjWithTexture(string path, bool removeUnused = true)
+    {
+        if (removeUnused)
+            RemoveUnusedVerticesAndUvs();
+
+        var materialsPath = Path.ChangeExtension(path, "mtl");
+
+        var folderPath = Path.GetDirectoryName(path) ?? string.Empty;
+
+        if (TexturesStrategy == TexturesStrategy.Repack || TexturesStrategy == TexturesStrategy.RepackCompressed)
+            TrimTextures(folderPath);
+        using (var writer = new FormattingStreamWriter(path, CultureInfo.InvariantCulture))
+        {
+            writer.Write("o ");
+            writer.WriteLine(string.IsNullOrWhiteSpace(Name) ? DefaultName : Name);
+
+            writer.WriteLine("mtllib {0}", Path.GetFileName(materialsPath));
+
+            for (var i = 0; i < _vertices.Count; i++)
+            {
+                var vertex = _vertices[i];
+                writer.Write("v ");
+                writer.Write(vertex.X);
+                writer.Write(" ");
+                writer.Write(vertex.Y);
+                writer.Write(" ");
+                writer.Write(vertex.Z);
+
+                if (_vertexColors != null)
+                {
+                    var color = _vertexColors[i];
+                    writer.Write(" ");
+                    writer.Write(color.R);
+                    writer.Write(" ");
+                    writer.Write(color.G);
+                    writer.Write(" ");
+                    writer.Write(color.B);
+                }
+
+                writer.WriteLine();
+            }
+
+            foreach (var textureVertex in _textureVertices)
+            {
+                writer.Write("vt ");
+                writer.Write(textureVertex.X);
+                writer.Write(" ");
+                writer.WriteLine(textureVertex.Y);
+            }
+
+            var materialFaces = from face in _faces
+                                group face by face.MaterialIndex
+                into g
+                                select g;
+
+            // NOTE: If there are groups of faces without materials, they must be placed at the beginning
+            foreach (var grp in materialFaces.OrderBy(item => item.Key))
+            {
+                writer.WriteLine($"usemtl {_materials[grp.Key].Name}");
+
+                foreach (var face in grp)
+                    writer.WriteLine(face.ToObj());
+            }
+        }
+
+        var mtlFilePath = Path.ChangeExtension(path, "mtl");
+
+        using (var writer = new FormattingStreamWriter(mtlFilePath, CultureInfo.InvariantCulture))
+        {
+            for (var index = 0; index < _materials.Count; index++)
+            {
+                var material = _materials[index];
+
+                if (material.Texture != null)
+                {
+                    switch (TexturesStrategy)
+                    {
+                        case TexturesStrategy.KeepOriginal:
+                            {
+                                var folder = Path.GetDirectoryName(path);
+
+                                var textureFileName =
+                                    $"{Path.GetFileNameWithoutExtension(path)}-texture-{index}{Path.GetExtension(material.Texture)}";
+
+                                var newTexturePath =
+                                    folder != null ? Path.Combine(folder, textureFileName) : textureFileName;
+
+                                if (!File.Exists(newTexturePath))
+                                    File.Copy(material.Texture, newTexturePath, true);
+
+                                material.Texture = textureFileName;
+                                break;
+                            }
+                        case TexturesStrategy.Compress:
+                            {
+                                var folder = Path.GetDirectoryName(path);
+
+                                var textureFileName =
+                                    $"{Path.GetFileNameWithoutExtension(path)}-texture-{index}{(TextureFormat == TextureFormat.Webp ? ".webp" : ".jpg")}";
+
+                                var newTexturePath =
+                                    folder != null ? Path.Combine(folder, textureFileName) : textureFileName;
+
+                                if (File.Exists(newTexturePath))
+
+                                    File.Delete(newTexturePath);
+
+                                Console.WriteLine($" -> Compressing texture '{material.Texture}'");
+
+                                using (var image = Image.Load(material.Texture))
+                                {
+                                    ApplyTextureSizeLimit(image);
+                                    if (TextureFormat == TextureFormat.Webp)
+                                        image.SaveAsWebp(newTexturePath, new WebpEncoder { FileFormat = WebpFileFormatType.Lossy, Quality = Math.Clamp(TextureQuality, 1, 100) });
+                                    else
+                                        image.SaveAsJpeg(newTexturePath, CreateEncoder());
+                                }
+
+                                material.Texture = textureFileName;
+                                break;
+                            }
+                    }
+                }
+
+                writer.WriteLine(material.ToMtl());
+            }
+        }
+    }
+
+    private void _WriteObjWithoutTexture(string path, bool removeUnused = true)
+    {
+        if (removeUnused)
+            RemoveUnusedVertices();
+
+        using var writer = new FormattingStreamWriter(path, CultureInfo.InvariantCulture);
+
+        writer.Write("o ");
+        writer.WriteLine(string.IsNullOrWhiteSpace(Name) ? DefaultName : Name);
+
+        for (var index = 0; index < _vertices.Count; index++)
+        {
+            var vertex = _vertices[index];
+            writer.Write("v ");
+            writer.Write(vertex.X);
+            writer.Write(" ");
+            writer.Write(vertex.Y);
+            writer.Write(" ");
+            writer.Write(vertex.Z);
+
+            if (_vertexColors != null)
+            {
+                var color = _vertexColors[index];
+                writer.Write(" ");
+                writer.Write(color.R);
+                writer.Write(" ");
+                writer.Write(color.G);
+                writer.Write(" ");
+                writer.Write(color.B);
+            }
+
+            writer.WriteLine();
+        }
+
+        for (var index = 0; index < _faces.Count; index++)
+        {
+            var face = _faces[index];
+            writer.WriteLine(face.ToObj());
+        }
+    }
+
+    public int FacesCount => _faces.Count;
+    public int VertexCount => _vertices.Count;
+
+    #endregion
+}
+
+public enum TexturesStrategy
+{
+    KeepOriginal,
+    Compress,
+    Repack,
+    RepackCompressed
+}
+
+public enum TextureFormat
+{
+    Jpeg,
+    Webp,
+    Ktx2
+}

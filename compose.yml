@@ -1,0 +1,27 @@
+services:
+  model-conversion-service:
+    build:
+      context: .
+    image: model-conversion-service:local
+    restart: unless-stopped
+    ports:
+      - "8091:8080"
+    environment:
+      Conversion__MaxConcurrentJobs: "1"
+      Conversion__JobTimeoutMinutes: "720"
+    volumes:
+      # 输入卷只读；输出与状态各自持久化，重启后作业状态可恢复。
+      - ./data/input:/data/input:ro
+      - ./data/output:/data/output
+      - ./data/state:/data/state
+    healthcheck:
+      test: ["CMD", "dotnet", "/app/health/HealthProbe.dll"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "8"
+          memory: 24G

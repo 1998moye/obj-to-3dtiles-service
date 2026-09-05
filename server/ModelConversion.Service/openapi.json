@@ -1,0 +1,281 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "模型转换服务 API",
+    "version": "v1",
+    "description": "OBJ → 3D Tiles 独立转换服务。创建异步转换作业，查询状态，取消/重试，并在成功后通过结果地址读取 tileset.json 及其相对引用资源。详细字段约束见《项目说明.md》。"
+  },
+  "paths": {
+    "/health/live": {
+      "get": {
+        "summary": "存活探针",
+        "responses": {
+          "200": { "description": "进程存活" }
+        }
+      }
+    },
+    "/health/ready": {
+      "get": {
+        "summary": "就绪探针（Obj2Tiles 可执行文件与数据目录可用）",
+        "responses": {
+          "200": { "description": "就绪" },
+          "503": { "description": "未就绪" }
+        }
+      }
+    },
+    "/openapi/v1.json": {
+      "get": {
+        "summary": "本文档",
+        "responses": {
+          "200": { "description": "OpenAPI JSON 文档" }
+        }
+      }
+    },
+    "/api/v1/conversions": {
+      "post": {
+        "summary": "创建转换作业",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/CreateConversionRequest" },
+              "example": {
+                "inputPath": "obj1/odm_textured_model_geo.obj",
+                "outputPath": "county/demo-001",
+                "profile": "industrial-jpeg",
+                "referenceLlaPath": "obj1/reference_lla.json",
+                "geoReference": null,
+                "overrides": {
+                  "lods": 5,
+                  "minGeometryQuality": 0.5,
+                  "maxTextureSize": 2048,
+                  "textureFormat": "Jpeg",
+                  "textureQuality": 85
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "作业已排队",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ConversionJobResponse" } } }
+          },
+          "400": {
+            "description": "参数错误（未知字段、非法范围、互斥组合、路径越界、输入不存在等）",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "409": {
+            "description": "输出路径已存在或被进行中任务占用",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          }
+        }
+      },
+      "get": {
+        "summary": "列出全部作业（按创建时间倒序）",
+        "responses": {
+          "200": {
+            "description": "作业列表",
+            "content": {
+              "application/json": {
+                "schema": { "type": "array", "items": { "$ref": "#/components/schemas/ConversionJobResponse" } }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/conversions/{id}": {
+      "get": {
+        "summary": "查询单个作业",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "responses": {
+          "200": {
+            "description": "作业详情",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ConversionJobResponse" } } }
+          },
+          "404": { "description": "作业不存在" }
+        }
+      }
+    },
+    "/api/v1/conversions/{id}/status": {
+      "get": {
+        "summary": "查询作业精简状态（包含是否可取消与当前进度）",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "responses": {
+          "200": { "description": "作业状态", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ConversionStatusResponse" } } } },
+          "404": { "description": "作业不存在" }
+        }
+      }
+    },
+    "/api/v1/conversions/{id}/progress": {
+      "get": {
+        "summary": "查询作业实时进度",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "responses": {
+          "200": { "description": "当前进度", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ConversionProgressResponse" } } } },
+          "404": { "description": "作业不存在" }
+        }
+      }
+    },
+    "/api/v1/conversions/{id}/cancel": {
+      "post": {
+        "summary": "取消作业（排队中立即取消；运行中请求取消）",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "responses": {
+          "202": { "description": "已接受", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ConversionJobResponse" } } } },
+          "404": { "description": "作业不存在" },
+          "409": { "description": "任务正在切换运行状态", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/api/v1/conversions/{id}/retry": {
+      "post": {
+        "summary": "重试失败或已取消作业（新作业复用原参数快照与输出位置）",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "responses": {
+          "202": { "description": "新作业已排队", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ConversionJobResponse" } } } },
+          "404": { "description": "作业不存在" },
+          "409": { "description": "只有失败或已取消任务可以重试", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/api/v1/conversions/{id}/result/{path}": {
+      "get": {
+        "summary": "读取成功作业的已发布结果文件（支持 tileset 相对引用）",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } },
+          { "name": "path", "in": "path", "required": true, "schema": { "type": "string" }, "description": "输出目录内相对路径，如 tileset.json、subtrees/region.json、tile.b3dm" }
+        ],
+        "responses": {
+          "200": { "description": "文件内容；MIME 按扩展名：json/b3dm/glb/jpg/png/webp/ktx2" },
+          "404": { "description": "作业不存在、未成功、文件不存在或路径越界" }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "CreateConversionRequest": {
+        "type": "object",
+        "required": ["inputPath"],
+        "additionalProperties": false,
+        "properties": {
+          "inputPath": { "type": "string", "description": "InputRoot 内的 .obj 相对路径" },
+          "outputPath": { "type": "string", "nullable": true, "description": "OutputRoot 内相对目录；省略时为 jobs/{jobId}；拒绝绝对路径、..、保留前缀 jobs/" },
+          "profile": { "type": "string", "default": "industrial-jpeg", "description": "配置档名称（服务配置 Conversion:Profiles）" },
+          "referenceLlaPath": { "type": "string", "nullable": true, "description": "InputRoot 内 reference_lla.json 相对路径；与 geoReference 互斥" },
+          "geoReference": { "$ref": "#/components/schemas/GeoReference" },
+          "overrides": { "$ref": "#/components/schemas/ConversionOverrides" }
+        }
+      },
+      "GeoReference": {
+        "type": "object",
+        "required": ["latitude", "longitude", "altitude"],
+        "properties": {
+          "latitude": { "type": "number", "minimum": -90, "maximum": 90 },
+          "longitude": { "type": "number", "minimum": -180, "maximum": 180 },
+          "altitude": { "type": "number" }
+        }
+      },
+      "ConversionOverrides": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "白名单覆盖字段，全部为可空；null/缺省表示沿用 profile 基础值",
+        "properties": {
+          "lods": { "type": "integer", "minimum": 1, "maximum": 10 },
+          "minGeometryQuality": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 },
+          "hierarchical": { "type": "boolean" },
+          "hlodErrorDivisor": { "type": "number", "exclusiveMinimum": 0 },
+          "hlodTargetRatio": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 },
+          "externalTilesetDepth": { "type": "integer", "minimum": 0, "maximum": 8 },
+          "octree": { "type": "boolean" },
+          "divisions": { "type": "integer", "minimum": 0, "maximum": 8 },
+          "zsplit": { "type": "boolean" },
+          "splitStrategy": { "type": "string", "enum": ["AbsoluteCenter", "VertexBaricenter", "VertexMedian"] },
+          "lodTextureScale": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 },
+          "maxTextureSize": { "type": "integer", "minimum": 128, "maximum": 8192 },
+          "textureFormat": { "type": "string", "enum": ["Jpeg", "Webp", "Ktx2"] },
+          "textureQuality": { "type": "integer", "minimum": 1, "maximum": 100 },
+          "ktx2Quality": { "type": "integer", "minimum": 1, "maximum": 255 },
+          "local": { "type": "boolean" }
+        }
+      },
+      "ConversionJobResponse": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "state": { "type": "string", "enum": ["Queued", "Running", "Validating", "Succeeded", "Failed", "Canceled"] },
+          "profileName": { "type": "string" },
+          "settingsSnapshot": { "$ref": "#/components/schemas/ConversionOverrides" },
+          "inputRelativePath": { "type": "string" },
+          "referenceLlaRelativePath": { "type": "string", "nullable": true },
+          "outputRelativePath": { "type": "string" },
+          "geoReference": { "$ref": "#/components/schemas/GeoReference" },
+          "attempt": { "type": "integer" },
+          "previousJobId": { "type": "string", "format": "uuid", "nullable": true },
+          "createdAt": { "type": "string", "format": "date-time" },
+          "updatedAt": { "type": "string", "format": "date-time" },
+          "startedAt": { "type": "string", "format": "date-time", "nullable": true },
+          "completedAt": { "type": "string", "format": "date-time", "nullable": true },
+          "exitCode": { "type": "integer", "nullable": true },
+          "diagnostic": { "type": "string", "nullable": true },
+          "validation": { "$ref": "#/components/schemas/TilesetValidationReport" },
+          "tilesetUrl": { "type": "string", "nullable": true, "description": "仅成功作业返回，/api/v1/conversions/{id}/result/tileset.json" },
+          "progress": { "$ref": "#/components/schemas/ConversionProgress" },
+          "canCancel": { "type": "boolean" }
+        }
+      },
+      "ConversionProgress": {
+        "type": "object",
+        "required": ["percent", "stage", "updatedAt"],
+        "properties": {
+          "percent": { "type": "integer", "minimum": 0, "maximum": 100 },
+          "stage": { "type": "string", "enum": ["Queued", "Preparing", "Converting", "Validating", "Publishing", "Canceling", "Completed", "Failed", "Canceled"] },
+          "message": { "type": "string", "nullable": true },
+          "updatedAt": { "type": "string", "format": "date-time" }
+        }
+      },
+      "ConversionStatusResponse": {
+        "type": "object",
+        "required": ["id", "state", "canCancel", "updatedAt", "progress"],
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "state": { "type": "string", "enum": ["Queued", "Running", "Validating", "Succeeded", "Failed", "Canceled"] },
+          "canCancel": { "type": "boolean" },
+          "diagnostic": { "type": "string", "nullable": true },
+          "updatedAt": { "type": "string", "format": "date-time" },
+          "progress": { "$ref": "#/components/schemas/ConversionProgress" }
+        }
+      },
+      "ConversionProgressResponse": {
+        "type": "object",
+        "required": ["id", "state", "percent", "stage", "updatedAt"],
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "state": { "type": "string", "enum": ["Queued", "Running", "Validating", "Succeeded", "Failed", "Canceled"] },
+          "percent": { "type": "integer", "minimum": 0, "maximum": 100 },
+          "stage": { "type": "string", "enum": ["Queued", "Preparing", "Converting", "Validating", "Publishing", "Canceling", "Completed", "Failed", "Canceled"] },
+          "message": { "type": "string", "nullable": true },
+          "updatedAt": { "type": "string", "format": "date-time" }
+        }
+      },
+      "TilesetValidationReport": {
+        "type": "object",
+        "properties": {
+          "tilesetCount": { "type": "integer" },
+          "tileCount": { "type": "integer" },
+          "contentCount": { "type": "integer" },
+          "totalBytes": { "type": "integer", "format": "int64" },
+          "rootGeometricError": { "type": "number" }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "properties": {
+          "error": { "type": "string" }
+        }
+      }
+    }
+  }
+}

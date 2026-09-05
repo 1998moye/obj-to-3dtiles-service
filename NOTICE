@@ -1,0 +1,22 @@
+Model Conversion Service
+Copyright (c) 2026 1998moye
+
+Project source:
+https://github.com/1998moye/standalone-model-conversion-service
+
+The original service code and documentation are provided under the
+Model Conversion Service Source-Available License 1.0 in LICENSE.
+Non-commercial use requires attribution. Commercial use requires a separate
+written license from the copyright holder.
+
+Third-party software
+--------------------
+
+Obj2Tiles
+Location: third-party/Obj2Tiles
+License: GNU Affero General Public License version 3
+License text: third-party/Obj2Tiles/LICENSE.md
+
+Obj2Tiles contains local modifications used by this service. Those files remain
+subject to their stated AGPL-3.0 license and are not relicensed by the repository
+root LICENSE.
