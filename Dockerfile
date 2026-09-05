@@ -31,6 +31,10 @@ WORKDIR /app/service
 COPY --from=build /artifacts/obj2tiles/ /app/obj2tiles/
 COPY --from=build /artifacts/service/ /app/service/
 COPY --from=build /artifacts/health/ /app/health/
+COPY LICENSE NOTICE /app/licenses/
+COPY third-party/Obj2Tiles/LICENSE.md /app/licenses/Obj2Tiles-AGPL-3.0.md
+COPY third-party/meshoptimizer/LICENSE-Meshoptimizer.NET.txt /app/licenses/
+COPY third-party/meshoptimizer/LICENSE-meshoptimizer.txt /app/licenses/
 RUN mkdir -p /data/input /data/output /data/state && chown -R "$APP_UID:$APP_UID" /data
 USER $APP_UID
 ENV ASPNETCORE_URLS=http://+:8080

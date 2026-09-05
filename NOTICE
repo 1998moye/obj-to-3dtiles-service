@@ -20,3 +20,16 @@ License text: third-party/Obj2Tiles/LICENSE.md
 Obj2Tiles contains local modifications used by this service. Those files remain
 subject to their stated AGPL-3.0 license and are not relicensed by the repository
 root LICENSE.
+
+Meshoptimizer.NET 1.0.7
+Source: https://github.com/BoyBaykiller/Meshoptimizer.NET
+License: MIT
+License text: third-party/meshoptimizer/LICENSE-Meshoptimizer.NET.txt
+
+meshoptimizer
+Source: https://github.com/zeux/meshoptimizer
+License: MIT
+License text: third-party/meshoptimizer/LICENSE-meshoptimizer.txt
+
+Meshoptimizer.NET and its native meshoptimizer binaries are restored from NuGet
+during the build. Their source and binaries are not vendored in this repository.

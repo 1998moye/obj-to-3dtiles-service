@@ -447,4 +447,4 @@ Vite 开发服务器对 `public/` 下点开头目录（如 `.tmp`）运行期间
 - 仓库原创服务代码、配置和文档适用根目录 [LICENSE](./LICENSE)：非商业使用免费，必须保留版权声明并注明项目名称、作者和仓库地址；商业使用必须通过 GitHub 账号或仓库 Issue 联系作者并取得单独书面授权。
 - 这是带非商业限制的**源码公开许可证**，不是 OSI 定义下的开源许可证。
 - `third-party/Obj2Tiles` 及本仓库对它的定制修改继续适用 AGPL-3.0，详见 [third-party/Obj2Tiles/LICENSE.md](./third-party/Obj2Tiles/LICENSE.md)，不受根目录商业限制重新许可。
-- 第三方声明汇总见 [NOTICE](./NOTICE)；meshoptimizer 为 MIT，通过 Obj2Tiles 依赖的官方 NuGet 原生包引入。
+- 第三方声明汇总见 [NOTICE](./NOTICE)。meshoptimizer 为 MIT，通过固定版本的 `Meshoptimizer.NET 1.0.7` NuGet 包在构建时引入，因此仓库不重复提交其源码和二进制；来源及完整许可证见 [third-party/meshoptimizer](./third-party/meshoptimizer/README.md)。相关许可证也会复制到 Docker 镜像的 `/app/licenses`。
