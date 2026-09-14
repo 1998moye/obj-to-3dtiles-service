@@ -2,6 +2,8 @@
 
 独立的 **OBJ → 3D Tiles** 转换服务。接收 NodeODM/ODM 摄影测量生成的地理参考 OBJ（`odm_textured_model_geo.obj`），输出可被 Mars3D/CesiumJS 稳定加载的 3D Tiles（空间优先 HLOD、meshoptimizer 绝对误差简化、边界锁定、REPLACE 精化、外部 tileset、纹理逐级降采样）。
 
+> 第一次使用？请先阅读 [使用教程](./使用教程.md)，按路线 A/B/C 任选一种方式跑通第一次转换；本 README 是完整的参数与接口参考。
+
 本项目源码公开：非商业使用免费但必须注明项目来源；商业使用必须提前联系作者取得书面授权。仓库内第三方 Obj2Tiles 代码继续适用其 AGPL-3.0 许可证，详情见[许可与商业使用](#许可与商业使用)。
 
 同一个可执行文件/同一个 Docker 镜像提供两种用法：
