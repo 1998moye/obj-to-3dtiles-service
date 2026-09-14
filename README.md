@@ -1,4 +1,4 @@
-# 模型转换服务（Model Conversion Service）
+# OBJ 转 3D Tiles 服务（obj-to-3dtiles-service）
 
 独立的 **OBJ → 3D Tiles** 转换服务。接收 NodeODM/ODM 摄影测量生成的地理参考 OBJ（`odm_textured_model_geo.obj`），输出可被 Mars3D/CesiumJS 稳定加载的 3D Tiles（空间优先 HLOD、meshoptimizer 绝对误差简化、边界锁定、REPLACE 精化、外部 tileset、纹理逐级降采样）。
 
@@ -39,12 +39,12 @@
 直接使用已发布的 `v3.1` 镜像：
 
 ```powershell
-docker pull dz98/model-conversion-service:v3.1
+docker pull dz98/obj-to-3dtiles-service:v3.1
 
 docker run --rm `
   -v "C:/Users/qkp/Desktop:/data/input:ro" `
   -v "D:/tiles:/data/output" `
-  dz98/model-conversion-service:v3.1 `
+  dz98/obj-to-3dtiles-service:v3.1 `
   convert --input /data/input/obj2 --output /data/output/obj2 `
   --lat 33.62678591 --lon 117.00336389 --alt 0 --lods 4
 ```
@@ -68,9 +68,9 @@ Compose 使用 `pull_policy: always`，即使服务器本地已经存在同名 `
 
 Compose 默认使用宿主机绝对目录，不依赖 compose 文件所在目录，也不要求 Windows 存在 D 盘：
 
-- Windows：`%USERPROFILE%/model-conversion-service-data`；
-- Linux：`/var/lib/model-conversion-service-data`；
-- 显式设置 `MODEL_CONVERSION_DATA_ROOT` 时优先采用该绝对路径。
+- Windows：`%USERPROFILE%/obj-to-3dtiles-service-data`；
+- Linux：`/var/lib/obj-to-3dtiles-service-data`；
+- 显式设置 `OBJ_TO_3DTILES_DATA_ROOT` 时优先采用该绝对路径。
 
 一次性的 `volume-init` 容器创建目录内的
 `input/output/state` 并交给镜像内 UID 1654 后退出，正式服务继续以非 root 用户运行；因此
@@ -82,8 +82,8 @@ Compose 不再固定 24G 内存上限，服务会根据部署机器实际可见�
 从源码构建后仍使用同一份 Compose：
 
 ```powershell
-docker build -t model-conversion-service:local .
-$env:MODEL_CONVERSION_IMAGE = "model-conversion-service:local"
+docker build -t obj-to-3dtiles-service:local .
+$env:OBJ_TO_3DTILES_IMAGE = "obj-to-3dtiles-service:local"
 docker compose up -d
 ```
 
@@ -96,11 +96,11 @@ docker compose up -d
 | `state` | `/data/obj2tiles/state` | 作业状态、日志和上传暂存，重启后恢复 |
 
 例如 Windows 用户 `qkp` 的结果默认可直接在
-`C:\Users\qkp\model-conversion-service-data\output` 查看；Linux 默认在
-`/var/lib/model-conversion-service-data/output`。需要更换磁盘时才设置覆盖变量：
+`C:\Users\qkp\obj-to-3dtiles-service-data\output` 查看；Linux 默认在
+`/var/lib/obj-to-3dtiles-service-data/output`。需要更换磁盘时才设置覆盖变量：
 
 ```powershell
-$env:MODEL_CONVERSION_DATA_ROOT = "E:/model-data"
+$env:OBJ_TO_3DTILES_DATA_ROOT = "E:/model-data"
 docker compose up -d
 ```
 
@@ -130,7 +130,7 @@ $upload
 docker run --rm `
   -v D:\models:/data/input:ro `
   -v D:\tiles:/data/output `
-  model-conversion-service:local `
+  obj-to-3dtiles-service:local `
   convert --input /data/input/obj1 --output /data/output/obj1 --profile industrial-jpeg --reference-lla /data/input/obj1/reference_lla.json
 ```
 
@@ -313,7 +313,7 @@ $tilesetUrl
 下载并解压完整结果目录：
 
 ```powershell
-$downloadDir = Join-Path $env:USERPROFILE "Downloads\model-conversion-$id"
+$downloadDir = Join-Path $env:USERPROFILE "Downloads\obj-to-3dtiles-$id"
 New-Item -ItemType Directory -Path $downloadDir -Force | Out-Null
 
 $resultZip = Join-Path $downloadDir "result.zip"
@@ -337,8 +337,8 @@ Invoke-WebRequest `
 服务器上的实际持久化位置为：
 
 ```text
-Windows 默认：%USERPROFILE%\model-conversion-service-data
-Linux 默认：  /var/lib/model-conversion-service-data
+Windows 默认：%USERPROFILE%\obj-to-3dtiles-service-data
+Linux 默认：  /var/lib/obj-to-3dtiles-service-data
 
 input/uploads/<uploadId>/              上传并解压后的源模型
 output/jobs/<conversionId>/            转换结果
@@ -357,7 +357,7 @@ ModelConversion.Service convert ...      同步执行一次转换
 ModelConversion.Service --help           显示帮助
 ```
 
-Docker 下对应 `docker run --rm model-conversion-service:local [serve|convert|--help] ...`。
+Docker 下对应 `docker run --rm obj-to-3dtiles-service:local [serve|convert|--help] ...`。
 
 ### convert 参数
 
@@ -431,7 +431,7 @@ Docker 下对应 `docker run --rm model-conversion-service:local [serve|convert|
 
 ### 输出语义
 
-- stdout 打印单调递增的阶段进度、Obj2Tiles 详细过程、最终 `tileset.json` 绝对路径、耗时与校验摘要；详细输出也会保留在 `<输出目录>.log`。HTTP 服务模式下，同样可通过 `docker compose logs -f model-conversion-service` 查看实时转换日志。
+- stdout 打印单调递增的阶段进度、Obj2Tiles 详细过程、最终 `tileset.json` 绝对路径、耗时与校验摘要；详细输出也会保留在 `<输出目录>.log`。HTTP 服务模式下，同样可通过 `docker compose logs -f obj-to-3dtiles-service` 查看实时转换日志。
 - 暂存目录位于输出旁的 `<输出>.staging-<id>`；转换+校验全部通过后**原子发布**为最终目录（跨挂载点时自动退化为复制后删除）。失败/取消时暂存被清理、最终目录不可见，日志保留。
 - 校验内容：tileset 树结构（含外部子树递归）、geometricError 单调性、REPLACE 精化、b3dm/glb 二进制头与长度、路径越界防护。
 
@@ -447,7 +447,7 @@ dotnet ModelConversion.Service.dll convert --input ./obj1 --output ./tiles/obj1 
 Docker（真实坐标定位）：
 
 ```powershell
-docker run --rm -v D:\models:/data/input:ro -v D:\tiles:/data/output model-conversion-service:local convert --input /data/input/obj1 --output /data/output/obj1 --lat 33.62678591 --lon 117.00336389 --alt 0
+docker run --rm -v D:\models:/data/input:ro -v D:\tiles:/data/output obj-to-3dtiles-service:local convert --input /data/input/obj1 --output /data/output/obj1 --lat 33.62678591 --lon 117.00336389 --alt 0
 ```
 
 ## HTTP API 参考
@@ -817,7 +817,7 @@ $tilesetUrl
 
 ```powershell
 docker compose build
-docker run --rm model-conversion-service:local --help
+docker run --rm obj-to-3dtiles-service:local --help
 docker compose up -d
 Invoke-RestMethod http://127.0.0.1:8091/health/ready
 ```
@@ -849,13 +849,13 @@ docker load -i dotnet-aspnet_10.0.tar
 宿主（Windows）侧两者皆可（Git Bash 里用 `/d/...`）；容器内（Linux）参数必须 `/`，如 `--input /data/input/obj1`。挂卷语法 `-v 宿主路径:容器路径[:ro]`，冒号左侧随意、右侧必须 `/`。
 
 **CLI 跑起来没有进度输出，是不是卡死？**
-当前版本会在 stdout/容器控制台显示阶段进度和 Obj2Tiles 详细过程，同时写入 `<输出>.log`。另开窗口执行 `Get-Content <输出>.log -Wait -Tail 20`（PowerShell），或使用 `docker compose logs -f model-conversion-service` 跟随日志。
+当前版本会在 stdout/容器控制台显示阶段进度和 Obj2Tiles 详细过程，同时写入 `<输出>.log`。另开窗口执行 `Get-Content <输出>.log -Wait -Tail 20`（PowerShell），或使用 `docker compose logs -f obj-to-3dtiles-service` 跟随日志。
 
 **创建 API 作业返回“输入文件不存在”？**
 `inputPath` 不是宿主机绝对路径，而是服务 `InputRoot`（默认 `/data/obj2tiles/input`）下的相对路径。
 不要自行拼接路径，优先使用 `POST /api/v1/uploads` 响应中的 `inputPath`。若人工排查，Linux 宿主机默认文件位于
-`/var/lib/model-conversion-service-data/input`，Windows 默认位于
-`%USERPROFILE%\model-conversion-service-data\input`。
+`/var/lib/obj-to-3dtiles-service-data/input`，Windows 默认位于
+`%USERPROFILE%\obj-to-3dtiles-service-data\input`。
 
 **查询 `/progress` 返回 405？**
 进度和状态查询只支持 GET，不要发送请求体：`GET /api/v1/conversions/{id}/progress`、`GET /api/v1/conversions/{id}/status`。创建、取消和重试才使用 POST。
