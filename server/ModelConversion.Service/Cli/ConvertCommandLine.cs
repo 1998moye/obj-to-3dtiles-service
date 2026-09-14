@@ -30,6 +30,10 @@ public sealed class ConvertCommandLine
     public ConversionTextureFormat? TextureFormat { get; set; }
     public int? TextureQuality { get; set; }
     public int? Ktx2Quality { get; set; }
+    // [2026-09-07 深层封底剥离] --strip-deep-bottom false 关闭；另两个为阈值微调
+    public bool? StripDeepBottom { get; set; }
+    public double? DeepBottomMinDropMeters { get; set; }
+    public double? DeepBottomMarginMeters { get; set; }
 
     public bool HasGeoReference => ReferenceLlaPath != null || Latitude.HasValue;
 
@@ -50,6 +54,9 @@ public sealed class ConvertCommandLine
         TextureFormat = TextureFormat,
         TextureQuality = TextureQuality,
         Ktx2Quality = Ktx2Quality,
+        StripDeepBottom = StripDeepBottom,
+        DeepBottomMinDropMeters = DeepBottomMinDropMeters,
+        DeepBottomMarginMeters = DeepBottomMarginMeters,
         // --local 与地理参考互斥；显式提供坐标时强制关闭 profile 的 Local。
         Local = Local ? true : HasGeoReference ? false : null
     };
@@ -112,6 +119,9 @@ public sealed class ConvertCommandLine
         "texture-format" => Choice<ConversionTextureFormat>(value, name, parsed => command.TextureFormat = parsed),
         "texture-quality" => Integer(value, name, parsed => command.TextureQuality = parsed),
         "ktx2-quality" => Integer(value, name, parsed => command.Ktx2Quality = parsed),
+        "strip-deep-bottom" => Flag(value, name, parsed => command.StripDeepBottom = parsed),
+        "deep-bottom-min-drop" => Number(value, name, parsed => command.DeepBottomMinDropMeters = parsed),
+        "deep-bottom-margin" => Number(value, name, parsed => command.DeepBottomMarginMeters = parsed),
         _ => $"未知参数: --{name}"
     };
 

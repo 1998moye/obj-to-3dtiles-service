@@ -1,6 +1,7 @@
-﻿using System.Collections.Concurrent;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Text.Json;
+using Obj2Tiles.Library;
 using Obj2Tiles.Library.Geometry;
 
 namespace Obj2Tiles.Stages;
@@ -10,7 +11,9 @@ public static partial class StagesFacade
     public static async Task<Dictionary<string, Box3>[]> Split(string[] sourceFiles, string destFolder, int divisions,
         bool zsplit, bool keepOriginalTextures = false, SplitPointStrategy splitPointStrategy = SplitPointStrategy.VertexBaricenter,
         bool isOctree = false, float lodTextureScale = 1.0f,
-        int maxTextureSize = 0, int textureQuality = 75, TextureFormat textureFormat = TextureFormat.Jpeg)
+        int maxTextureSize = 0, int textureQuality = 75, TextureFormat textureFormat = TextureFormat.Jpeg,
+        // [2026-09-07 资源约束] 任务级纹理缓存与阶段并发上限由调用方（Program/资源计划）注入。
+        TextureCache? textureCache = null, int stageConcurrency = 1)
     {
         var results = new Dictionary<string, Box3>[sourceFiles.Length];
 
@@ -63,8 +66,11 @@ public static partial class StagesFacade
         Func<IMesh, Vertex3> replaySplitPoint = m =>
             splitPlan.TryGetValue(m.Name, out var pt) ? pt : baseSplitPoint(m);
 
-        // Split all LODs in parallel using the pre-computed split plan.
+        // Split all LODs using the pre-computed split plan, bounded by stage concurrency.
+        // [2026-09-07 阶段并发] 默认并发 1（逐 LOD 顺序处理）：槽位满时等待，
+        // 避免多个 LOD 的网格、解码纹理与图集同时驻留内存。
         // In octree mode, the finest LOD (index=0) gets the most divisions; each coarser LOD gets one fewer.
+        using var lodSlots = new SemaphoreSlim(Math.Max(1, stageConcurrency));
         var tasks = new List<Task<Dictionary<string, Box3>>>();
         for (var index = 0; index < sourceFiles.Length; index++)
         {
@@ -77,7 +83,7 @@ public static partial class StagesFacade
             int lodDivisions = isOctree ? divisions + sourceFiles.Length - index - 1 : divisions;
             float textureDownscale = index == 0 ? 1.0f : (float)Math.Pow(lodTextureScale, index);
 
-            tasks.Add(Split(file, dest, lodDivisions, zsplit, textureStrategy, splitPointStrategy, replaySplitPoint, textureDownscale, maxTextureSize, textureQuality, textureFormat));
+            tasks.Add(RunLodSplitBoundedAsync(file, dest, lodDivisions, textureStrategy, textureDownscale));
         }
 
         await Task.WhenAll(tasks);
@@ -86,6 +92,22 @@ public static partial class StagesFacade
             results[i] = tasks[i].Result;
 
         return results;
+
+        async Task<Dictionary<string, Box3>> RunLodSplitBoundedAsync(string file, string dest, int lodDivisions,
+            TexturesStrategy textureStrategy, float textureDownscale)
+        {
+            await lodSlots.WaitAsync();
+            try
+            {
+                return await Split(file, dest, lodDivisions, zsplit, textureStrategy, splitPointStrategy,
+                    replaySplitPoint, textureDownscale, maxTextureSize, textureQuality, textureFormat,
+                    textureCache, stageConcurrency);
+            }
+            finally
+            {
+                lodSlots.Release();
+            }
+        }
     }
 
     public static async Task<Dictionary<string, Box3>> Split(string sourcePath, string destPath, int divisions,
@@ -94,7 +116,8 @@ public static partial class StagesFacade
         TexturesStrategy textureStrategy = TexturesStrategy.Repack,
         SplitPointStrategy splitPointStrategy = SplitPointStrategy.VertexBaricenter,
         float textureDownscale = 1.0f,
-        int maxTextureSize = 0, int textureQuality = 75, TextureFormat textureFormat = TextureFormat.Jpeg)
+        int maxTextureSize = 0, int textureQuality = 75, TextureFormat textureFormat = TextureFormat.Jpeg,
+        TextureCache? textureCache = null, int stageConcurrency = 1)
     {
         Func<IMesh, Vertex3> getSplitPoint = splitPointStrategy switch
         {
@@ -104,7 +127,7 @@ public static partial class StagesFacade
             _ => throw new ArgumentOutOfRangeException(nameof(splitPointStrategy))
         };
 
-        return await Split(sourcePath, destPath, divisions, zSplit, textureStrategy, splitPointStrategy, getSplitPoint, textureDownscale, maxTextureSize, textureQuality, textureFormat);
+        return await Split(sourcePath, destPath, divisions, zSplit, textureStrategy, splitPointStrategy, getSplitPoint, textureDownscale, maxTextureSize, textureQuality, textureFormat, textureCache, stageConcurrency);
     }
 
     private static async Task<Dictionary<string, Box3>> Split(string sourcePath, string destPath, int divisions,
@@ -113,7 +136,8 @@ public static partial class StagesFacade
         SplitPointStrategy splitPointStrategy,
         Func<IMesh, Vertex3> getSplitPoint,
         float textureDownscale = 1.0f,
-        int maxTextureSize = 0, int textureQuality = 75, TextureFormat textureFormat = TextureFormat.Jpeg)
+        int maxTextureSize = 0, int textureQuality = 75, TextureFormat textureFormat = TextureFormat.Jpeg,
+        TextureCache? textureCache = null, int stageConcurrency = 1)
     {
         var sw = new Stopwatch();
         var tilesBounds = new Dictionary<string, Box3>();
@@ -139,6 +163,8 @@ public static partial class StagesFacade
                 t.MaxTextureSize = maxTextureSize;
                 t.TextureQuality = textureQuality;
                 t.TextureFormat = textureFormat;
+                t.TextureCache = textureCache;
+                t.StageConcurrency = stageConcurrency;
             }
 
             mesh.WriteObj(Path.Combine(destPath, $"{mesh.Name}.obj"));
@@ -185,7 +211,8 @@ public static partial class StagesFacade
         var progress = 0;
         var lodName = Path.GetFileName(destPath);
 
-        Parallel.ForEach(ms, m =>
+        // [2026-09-07 阶段并发] 瓦片写盘（含纹理解码与图集构建）并发受资源计划约束，默认 1。
+        Parallel.ForEach(ms, new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, stageConcurrency) }, m =>
         {
             var n = Interlocked.Increment(ref progress);
             m.DebugName = $"{lodName}-Mesh-{n}/{ms.Length}";
@@ -197,6 +224,8 @@ public static partial class StagesFacade
                 t.MaxTextureSize = maxTextureSize;
                 t.TextureQuality = textureQuality;
                 t.TextureFormat = textureFormat;
+                t.TextureCache = textureCache;
+                t.StageConcurrency = stageConcurrency;
             }
 
             var tilePath = Path.Combine(destPath, $"{m.Name}.obj");

@@ -1,4 +1,4 @@
-﻿using System.Diagnostics;
+using System.Diagnostics;
 using System.Globalization;
 using System.Numerics;
 using Obj2Tiles.Library.Algos;
@@ -56,6 +56,13 @@ public class MeshT : IMesh
     /// extension and is typically 25-35% smaller than JPEG at comparable quality.
     /// </summary>
     public TextureFormat TextureFormat { get; set; } = TextureFormat.Jpeg;
+
+    // [2026-09-07 任务级纹理缓存] 由 StagesFacade 注入的运行级缓存（按字节预算 + LRU 淘汰），
+    // Split 派生子网格时共享同一实例；未注入时重打包直接失败，不回退到任何静态全局缓存。
+    public TextureCache? TextureCache { get; set; }
+
+    // [2026-09-07 阶段并发] 图集编码并发上限（默认 1），由资源计划经 StagesFacade 注入。
+    public int StageConcurrency { get; set; } = 1;
 
     public MeshT(IEnumerable<Vertex3> vertices, IEnumerable<Vertex2> textureVertices,
         IEnumerable<FaceT> faces, IEnumerable<Material> materials, IEnumerable<RGB>? vertexColors = null)
@@ -237,11 +244,16 @@ public class MeshT : IMesh
 
         left = new MeshT(orderedLeftVertices, orderedLeftTextureVertices, leftFaces, leftMaterials, leftColors)
         {
-            Name = $"{Name}-{utils.Axis}L"
+            Name = $"{Name}-{utils.Axis}L",
+            // [2026-09-07 任务级纹理缓存] 子网格共享父网格的缓存实例，避免左右两半各自重复解码同一纹理。
+            TextureCache = TextureCache,
+            StageConcurrency = StageConcurrency
         };
         right = new MeshT(orderedRightVertices, orderedRightTextureVertices, rightFaces, rightMaterials, rightColors)
         {
-            Name = $"{Name}-{utils.Axis}R"
+            Name = $"{Name}-{utils.Axis}R",
+            TextureCache = TextureCache,
+            StageConcurrency = StageConcurrency
         };
 
         return count;
@@ -479,9 +491,11 @@ public class MeshT : IMesh
 
     private void TrimTextures(string targetFolder)
     {
-        var tasks = new List<Task>();
-
-        LoadTexturesCache();
+        // [2026-09-07 任务级纹理缓存] 纹理按需解码并受字节预算约束，
+        // 不再并行预载全部材质纹理到静态全局缓存。
+        var cache = TextureCache ?? throw new InvalidOperationException(
+            "MeshT.TextureCache 未注入：纹理重打包需要任务级缓存（由 StagesFacade 提供）");
+        using var saver = new BoundedAtlasSaver(StageConcurrency);
 
         var facesByMaterial = GetFacesByMaterial();
 
@@ -502,33 +516,24 @@ public class MeshT : IMesh
             // Sort clusters by count (improves packing density, could be removed if we notice a bottleneck)
             clusters.Sort((a, b) => b.Count.CompareTo(a.Count));
 
-            BinPackTextures(targetFolder, m, clusters, newTextureVertices, tasks);
+            BinPackTextures(targetFolder, m, clusters, newTextureVertices, cache, saver);
         }
 
         _textureVertices = newTextureVertices.OrderBy(item => item.Value).Select(item => item.Key).ToList();
 
-        var allSaves = Task.WhenAll(tasks);
         var saveSw = Stopwatch.StartNew();
         long nextSaveProgressMs = 5000;
-        while (!allSaves.Wait(100))
+        while (saver.PendingCount > 0)
         {
             if (saveSw.ElapsedMilliseconds >= nextSaveProgressMs)
             {
                 Console.WriteLine($" -> [{DebugName}] Saving texture atlases... ({saveSw.Elapsed.TotalSeconds:F0}s)");
                 nextSaveProgressMs += 5000;
             }
+            Thread.Sleep(100);
         }
-    }
-
-    private void LoadTexturesCache()
-    {
-        Parallel.ForEach(_materials, material =>
-        {
-            if (!string.IsNullOrEmpty(material.Texture))
-                TexturesCache.GetTexture(material.Texture);
-            if (!string.IsNullOrEmpty(material.NormalMap))
-                TexturesCache.GetTexture(material.NormalMap);
-        });
+        // 传播编码异常（若有）；此时任务均已结束，WaitAll 立即返回。
+        saver.WaitAll();
     }
 
     private JpegEncoder CreateEncoder() => new JpegEncoder { Quality = Math.Clamp(TextureQuality, 1, 100) };
@@ -583,7 +588,7 @@ public class MeshT : IMesh
     }
 
     private void BinPackTextures(string targetFolder, int materialIndex, IReadOnlyList<List<int>> clusters,
-        IDictionary<Vertex2, int> newTextureVertices, ICollection<Task> tasks)
+        IDictionary<Vertex2, int> newTextureVertices, TextureCache cache, BoundedAtlasSaver saver)
     {
         const int PADDING = 2; // <-- bleed ring
 
@@ -594,8 +599,15 @@ public class MeshT : IMesh
 
         if (material.Texture == null && material.NormalMap == null) return;
 
-        var texture = material.Texture != null ? TexturesCache.GetTexture(material.Texture) : null;
-        var normalMap = material.NormalMap != null ? TexturesCache.GetTexture(material.NormalMap) : null;
+        // [2026-09-07 任务级纹理缓存] 按需解码并固定当前材质用到的纹理；打包结束后释放。
+        // 必须捕获原始路径：打包过程中 material.Texture 会被改写为图集文件名，
+        // 若按改写后的值释放会找错缓存键。
+        var sourceTexturePath = material.Texture;
+        var sourceNormalMapPath = material.NormalMap;
+        var texture = sourceTexturePath != null ? cache.Rent(sourceTexturePath) : null;
+        var normalMap = sourceNormalMapPath != null ? cache.Rent(sourceNormalMapPath) : null;
+        try
+        {
 
         int textureWidth = material.Texture != null ? texture!.Width : normalMap!.Width;
         int textureHeight = material.Texture != null ? texture!.Height : normalMap!.Height;
@@ -696,11 +708,13 @@ public class MeshT : IMesh
 
                 if (material.Texture != null) {
                     newPathTexture = Path.Combine(targetFolder, textureFileName!);
+                    FillAtlasBackgroundForMipmaps(newTexture!);
                     SaveAtlas(newTexture!, newPathTexture); newTexture!.Dispose();
                 }
 
                 if (material.NormalMap != null) {
                     newPathNormalMap = Path.Combine(targetFolder, normalMapFileName!);
+                    FillAtlasBackgroundForMipmaps(newNormalMap!);
                     SaveAtlas(newNormalMap!, newPathNormalMap);
                     newNormalMap!.Dispose();
                 }
@@ -792,44 +806,101 @@ public class MeshT : IMesh
         }
 
         // ---------- saving ----------
+        // [2026-09-07 有界图集保存] 保存交给有界队列（默认并发 1，槽位满时反压），
+        // 图集图像由队列在编码完成后释放，不再随材质数量无限创建后台任务。
         if (material.Texture != null)
         {
             textureFileName = $"{Name}-texture-diffuse-{materialIndex}-{material.Name}{AtlasExtension(material.Texture)}";
             newPathTexture = Path.Combine(targetFolder, textureFileName);
+            FillAtlasBackgroundForMipmaps(newTexture!);
+            saver.Enqueue(newTexture!, newPathTexture, SaveAtlas);
+            material.Texture = textureFileName;
         }
 
         if (material.NormalMap != null)
         {
             normalMapFileName = $"{Name}-texture-normal-{materialIndex}-{material.Name}{AtlasExtension(material.NormalMap)}";
             newPathNormalMap = Path.Combine(targetFolder, normalMapFileName);
-        }
-
-        var saveTaskTexture = new Task(t =>
-        {
-            var tx = (Image<Rgba32>)t!;
-            SaveAtlas(tx, newPathTexture!);
-            tx.Dispose();
-        }, newTexture, TaskCreationOptions.LongRunning);
-
-        var saveTaskNormalMap = new Task(t =>
-        {
-            var tx = (Image<Rgba32>)t!;
-            SaveAtlas(tx, newPathNormalMap!);
-            tx.Dispose();
-        }, newNormalMap, TaskCreationOptions.LongRunning);
-
-        if (material.Texture != null) {
-            tasks.Add(saveTaskTexture);
-            saveTaskTexture.Start();
-            material.Texture = textureFileName;
-
-        }
-
-        if (material.NormalMap != null) {
-            tasks.Add(saveTaskNormalMap);
-            saveTaskNormalMap.Start();
+            FillAtlasBackgroundForMipmaps(newNormalMap!);
+            saver.Enqueue(newNormalMap!, newPathNormalMap, SaveAtlas);
             material.NormalMap = normalMapFileName;
         }
+        }
+        finally
+        {
+            // 释放当前材质租用的源纹理，使其成为可淘汰的缓存项。
+            if (sourceTexturePath != null) cache.Release(sourceTexturePath);
+            if (sourceNormalMapPath != null) cache.Release(sourceNormalMapPath);
+        }
+    }
+
+    /// <summary>
+    /// Extends valid atlas texels into unused transparent space before JPEG/WebP encoding.
+    /// Runtime-generated mip levels and anisotropic samples otherwise blend a chart's two-pixel
+    /// gutter with transparent black, producing the large dark polygons seen at coarse HLOD levels.
+    /// The operation is in-place and scanline-based so memory remains bounded to the current atlas.
+    /// </summary>
+    private static void FillAtlasBackgroundForMipmaps(Image<Rgba32> atlas)
+    {
+        var populatedRows = new List<int>(atlas.Height);
+        atlas.ProcessPixelRows(accessor =>
+        {
+            for (var y = 0; y < accessor.Height; y++)
+            {
+                var row = accessor.GetRowSpan(y);
+                var first = -1;
+                for (var x = 0; x < row.Length; x++)
+                {
+                    if (row[x].A == 0) continue;
+                    first = x;
+                    break;
+                }
+                if (first < 0) continue;
+
+                populatedRows.Add(y);
+                var previous = first;
+                for (var x = 0; x < first; x++) row[x] = row[first];
+                for (var x = first + 1; x < row.Length; x++)
+                {
+                    if (row[x].A == 0) continue;
+                    FillHorizontalGap(row, previous, x);
+                    previous = x;
+                }
+                for (var x = previous + 1; x < row.Length; x++) row[x] = row[previous];
+            }
+
+            if (populatedRows.Count == 0) return;
+
+            // [2026-09-07 修复 HLOD 黑色纹理块] 原代码：图集未占用像素保持透明黑，JPEG 编码时变成纯黑。
+            // 原因：低分辨率 mipmap 和斜视各向异性采样越过 2px padding 后会把黑色混入整个纹理小岛。
+            // 这里只复制当前图集的现有行，不创建同尺寸副本，4G/2G 档位仍保持单图有界内存。
+            CopyRowRange(accessor, 0, populatedRows[0] - 1, populatedRows[0]);
+            for (var i = 1; i < populatedRows.Count; i++)
+            {
+                var previous = populatedRows[i - 1];
+                var next = populatedRows[i];
+                for (var y = previous + 1; y < next; y++)
+                {
+                    var source = y - previous <= next - y ? previous : next;
+                    accessor.GetRowSpan(source).CopyTo(accessor.GetRowSpan(y));
+                }
+            }
+            CopyRowRange(accessor, populatedRows[^1] + 1, accessor.Height - 1, populatedRows[^1]);
+        });
+    }
+
+    private static void FillHorizontalGap(Span<Rgba32> row, int left, int right)
+    {
+        var midpoint = left + (right - left) / 2;
+        for (var x = left + 1; x <= midpoint; x++) row[x] = row[left];
+        for (var x = midpoint + 1; x < right; x++) row[x] = row[right];
+    }
+
+    private static void CopyRowRange(PixelAccessor<Rgba32> accessor, int start, int end, int source)
+    {
+        if (start > end) return;
+        var sourceRow = accessor.GetRowSpan(source);
+        for (var y = start; y <= end; y++) sourceRow.CopyTo(accessor.GetRowSpan(y));
     }
 
     // Adds bleed padding to each chart when estimating total area and max dims.
@@ -985,20 +1056,24 @@ public class MeshT : IMesh
     {
         var facesMapper = new Dictionary<int, List<int>>();
 
+        // [2026-09-07 非流形UV边邻接爆炸修复] 旧实现把共享同一条 UV 边的 K 个面两两全连接，
+        // 邻接条目数 K×(K-1)。真实 ODM 网格常把数十万个无纹理面映射到同一个微小 UV 三角形
+        // （实测单条边 K=254263），邻接表构建瞬间 OOM。改为链式邻接（每面只连列表中前后相邻面）：
+        // 连通分量与全连接完全一致（聚类结果不变、K=2 时逐条相同），时间与内存降为线性。
         foreach (var edge in edgesMapper)
         {
-            for (var i = 0; i < edge.Value.Count; i++)
+            var facesOnEdge = edge.Value;
+            for (var i = 0; i < facesOnEdge.Count; i++)
             {
-                var faceIndex = edge.Value[i];
-                if (!facesMapper.ContainsKey(faceIndex))
-                    facesMapper.Add(faceIndex, []);
+                var faceIndex = facesOnEdge[i];
+                if (!facesMapper.TryGetValue(faceIndex, out var adjacency))
+                    facesMapper.Add(faceIndex, adjacency = []);
 
-                for (var index = 0; index < edge.Value.Count; index++)
-                {
-                    var f = edge.Value[index];
-                    if (f != faceIndex)
-                        facesMapper[faceIndex].Add(f);
-                }
+                // 退化边列表可能重复包含同一面（三条边键相同），跳过自邻接。
+                if (i > 0 && facesOnEdge[i - 1] is var prev && prev != faceIndex)
+                    adjacency.Add(prev);
+                if (i + 1 < facesOnEdge.Count && facesOnEdge[i + 1] is var next && next != faceIndex)
+                    adjacency.Add(next);
             }
         }
 
@@ -1294,9 +1369,11 @@ public class MeshT : IMesh
         _vertexColors = newColors;
     }
 
-    // Crop the source rect, resize to (scaledW x scaledH), then add a padding-wide bleed ring by
-    // edge-pixel repetition. Resizing before padding ensures the interior occupies exactly
-    // [padding, padding+scaledW) in the returned block regardless of the scale factor.
+    // [2026-09-07 图集临时内存放大修复] 直接从源区域双线性采样到目标尺寸并写出 padding
+    // 出血环：全程只有目标尺寸块一次分配，不再创建“源分辨率完整裁剪副本 → Resize → padding”
+    // 的中间大图（原路径对大 UV 区域会临时分配 sw×sh×4 字节，是图集阶段的内存放大来源）。
+    // 像素中心对齐映射与原 Resize 一致（1:1 时退化为精确取整像素）；padding 仍复制缩放后
+    // 内部边缘像素；各通道独立插值（不做 alpha 预乘），透明与法线贴图语义不变。
     private static Image<Rgba32> BuildPaddedBlock(Image<Rgba32> src, Rectangle srcRect, int padding, int scaledW, int scaledH)
     {
         int sx = Math.Clamp(srcRect.X, 0, Math.Max(0, src.Width - 1));
@@ -1304,40 +1381,52 @@ public class MeshT : IMesh
         int sw = Math.Clamp(srcRect.Width, 1, src.Width - sx);
         int sh = Math.Clamp(srcRect.Height, 1, src.Height - sy);
 
-        // Step 1: crop the interior at full source resolution.
-        using var interior = new Image<Rgba32>(sw, sh);
-        src.ProcessPixelRows(interior, (srcAcc, intAcc) =>
-        {
-            for (int y = 0; y < sh; y++)
-            {
-                var srcRow = srcAcc.GetRowSpan(sy + y);
-                var intRow = intAcc.GetRowSpan(y);
-                for (int x = 0; x < sw; x++)
-                    intRow[x] = srcRow[sx + x];
-            }
-        });
-
-        // Step 2: resize the interior to the target atlas dimensions (skipped when 1:1).
-        if (scaledW != sw || scaledH != sh)
-            interior.Mutate(ctx => ctx.Resize(scaledW, scaledH));
-
-        // Step 3: add the bleed ring from the (now resized) interior edge pixels.
         var block = new Image<Rgba32>(scaledW + 2 * padding, scaledH + 2 * padding);
-        interior.ProcessPixelRows(block, (intAcc, blockAcc) =>
+        src.ProcessPixelRows(block, (srcAcc, blockAcc) =>
         {
             for (int destY = 0; destY < blockAcc.Height; destY++)
             {
+                // 出血环：块坐标先折算到缩放后内部坐标并钳制到边缘（与原“缩放后复制边缘像素”一致）。
                 int intY = Math.Clamp(destY - padding, 0, scaledH - 1);
-                var intRow = intAcc.GetRowSpan(intY);
+                float srcYf = Math.Clamp((intY + 0.5f) * sh / scaledH - 0.5f, 0f, sh - 1f);
+                int y0 = (int)srcYf;
+                int y1 = Math.Min(y0 + 1, sh - 1);
+                float fy = srcYf - y0;
+
+                var srcRow0 = srcAcc.GetRowSpan(sy + y0);
+                var srcRow1 = srcAcc.GetRowSpan(sy + y1);
                 var destRow = blockAcc.GetRowSpan(destY);
+
                 for (int destX = 0; destX < blockAcc.Width; destX++)
                 {
                     int intX = Math.Clamp(destX - padding, 0, scaledW - 1);
-                    destRow[destX] = intRow[intX];
+                    float srcXf = Math.Clamp((intX + 0.5f) * sw / scaledW - 0.5f, 0f, sw - 1f);
+                    int x0 = (int)srcXf;
+                    int x1 = Math.Min(x0 + 1, sw - 1);
+                    float fx = srcXf - x0;
+
+                    var c00 = srcRow0[sx + x0];
+                    var c10 = srcRow0[sx + x1];
+                    var c01 = srcRow1[sx + x0];
+                    var c11 = srcRow1[sx + x1];
+
+                    destRow[destX] = new Rgba32(
+                        Bilerp(c00.R, c10.R, c01.R, c11.R, fx, fy),
+                        Bilerp(c00.G, c10.G, c01.G, c11.G, fx, fy),
+                        Bilerp(c00.B, c10.B, c01.B, c11.B, fx, fy),
+                        Bilerp(c00.A, c10.A, c01.A, c11.A, fx, fy));
                 }
             }
         });
         return block;
+
+        // 凸组合（fx/fy ∈ [0,1]），结果必在 [0,255]；+0.5f 做四舍五入。
+        static byte Bilerp(float c00, float c10, float c01, float c11, float fx, float fy)
+        {
+            float top = c00 + (c10 - c00) * fx;
+            float bottom = c01 + (c11 - c01) * fx;
+            return (byte)(top + (bottom - top) * fy + 0.5f);
+        }
     }
 
 

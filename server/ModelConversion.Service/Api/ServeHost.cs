@@ -31,6 +31,9 @@ public static class ServeHost
         builder.Services.AddCors(cors => cors.AddDefaultPolicy(policy =>
             policy.AllowAnyOrigin().AllowAnyHeader().AllowAnyMethod()));
         builder.Services.AddHostedService<ConversionWorker>();
+        // [2026-09-09 Issue01] 上传会话后台合并（finalizing 恢复）与终态 TTL 清理（作业 + 过期会话）。
+        builder.Services.AddHostedService<UploadSessionFinalizer>();
+        builder.Services.AddHostedService<TerminalJobCleanupWorker>();
         configureServices?.Invoke(builder.Services);
 
         var app = builder.Build();
@@ -48,7 +51,11 @@ public static class ServeHost
         });
         app.MapGet("/openapi/v1.json", () =>
             Results.File(Path.Combine(AppContext.BaseDirectory, "openapi.json"), "application/json"));
+        app.MapModelUploadEndpoints();
         app.MapConversionEndpoints();
+        // [2026-09-09 Issue01] 健康容量与可恢复上传会话端点。
+        app.MapConverterHealthEndpoints();
+        app.MapUploadSessionEndpoints();
         return app;
     }
 }

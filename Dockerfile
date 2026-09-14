@@ -35,7 +35,8 @@ COPY LICENSE NOTICE /app/licenses/
 COPY third-party/Obj2Tiles/LICENSE.md /app/licenses/Obj2Tiles-AGPL-3.0.md
 COPY third-party/meshoptimizer/LICENSE-Meshoptimizer.NET.txt /app/licenses/
 COPY third-party/meshoptimizer/LICENSE-meshoptimizer.txt /app/licenses/
-RUN mkdir -p /data/input /data/output /data/state && chown -R "$APP_UID:$APP_UID" /data
+RUN mkdir -p /data/obj2tiles/input /data/obj2tiles/output /data/obj2tiles/state \
+    && chown -R "$APP_UID:$APP_UID" /data/obj2tiles
 USER $APP_UID
 ENV ASPNETCORE_URLS=http://+:8080
 EXPOSE 8080

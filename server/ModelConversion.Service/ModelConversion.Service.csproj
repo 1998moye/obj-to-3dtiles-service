@@ -9,4 +9,9 @@
   <ItemGroup>
     <Content Update="openapi.json" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
+  <ItemGroup>
+    <!-- [2026-09-07 超大纹理流式规范化] libvips 顺序访问 + 按需解码，单张超大纹理不完整常驻内存。 -->
+    <PackageReference Include="NetVips" Version="3.2.0" />
+    <PackageReference Include="NetVips.Native" Version="8.18.6" />
+  </ItemGroup>
 </Project>

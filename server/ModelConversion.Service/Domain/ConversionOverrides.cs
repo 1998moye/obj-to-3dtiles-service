@@ -19,4 +19,8 @@ public sealed record ConversionOverrides
     public int? TextureQuality { get; init; }
     public int? Ktx2Quality { get; init; }
     public bool? Local { get; init; }
+    // [2026-09-07 深层封底剥离] 单次覆盖；null=沿用 profile（默认开）
+    public bool? StripDeepBottom { get; init; }
+    public double? DeepBottomMinDropMeters { get; init; }
+    public double? DeepBottomMarginMeters { get; init; }
 }

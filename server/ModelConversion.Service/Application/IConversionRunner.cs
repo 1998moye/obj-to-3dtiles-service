@@ -21,7 +21,14 @@ public enum ConversionRunOutcome
     ConversionFailed,
     ValidationFailed,
     TimedOut,
-    Canceled
+    Canceled,
+    // 资源准入拒绝（内存档位不足/极低内存准入失败/硬性输入上限）。
+    ResourceRejected,
+    // 临时磁盘预算不足。
+    InsufficientDisk,
+    // [2026-09-07 疑似 OOM] 子进程退出码 137（SIGKILL）：疑似被容器 OOM Killer 终止，
+    // 与主动内存保护（看门狗在硬水位前拦截）和普通转换失败相区分。
+    SuspectedOomKilled
 }
 
 public sealed record ConversionRunResult(

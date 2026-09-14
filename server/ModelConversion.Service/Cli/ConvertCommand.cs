@@ -161,6 +161,18 @@ public static class ConvertCommand
                 stderr.WriteLine($"转换失败（Obj2Tiles 退出码 {result.ExitCode}）: {result.Diagnostic}");
                 stderr.WriteLine($"详细日志: {logPath}");
                 return CliExitCodes.ConversionFailed;
+            case ConversionRunOutcome.SuspectedOomKilled:
+                stderr.WriteLine($"疑似内存溢出（OOMKilled，退出码 {result.ExitCode}）: {result.Diagnostic}");
+                stderr.WriteLine($"详细日志: {logPath}");
+                return CliExitCodes.SuspectedOomKilled;
+            case ConversionRunOutcome.ResourceRejected:
+                stderr.WriteLine($"资源准入拒绝: {result.Diagnostic}");
+                stderr.WriteLine($"详细日志: {logPath}");
+                return CliExitCodes.ResourceRejected;
+            case ConversionRunOutcome.InsufficientDisk:
+                stderr.WriteLine($"临时磁盘不足: {result.Diagnostic}");
+                stderr.WriteLine($"详细日志: {logPath}");
+                return CliExitCodes.InsufficientDisk;
             case ConversionRunOutcome.Canceled:
                 stderr.WriteLine("转换已取消。");
                 return CliExitCodes.Canceled;

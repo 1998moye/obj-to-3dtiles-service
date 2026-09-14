@@ -31,6 +31,99 @@
         }
       }
     },
+    "/api/v1/uploads": {
+      "post": {
+        "summary": "上传 OBJ 模型 ZIP 包并发布到唯一输入目录",
+        "description": "请求正文直接发送 ZIP 字节，不使用 multipart。压缩包必须且只能包含一个 OBJ；可同时包含 MTL、纹理和 reference_lla.json。",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/zip": {
+              "schema": { "type": "string", "format": "binary" }
+            },
+            "application/x-zip-compressed": {
+              "schema": { "type": "string", "format": "binary" }
+            },
+            "application/octet-stream": {
+              "schema": { "type": "string", "format": "binary" }
+            }
+          }
+        },
+        "responses": {
+          "201": { "description": "上传完成并原子发布", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ModelUploadResponse" } } } },
+          "400": { "description": "ZIP 损坏、路径非法、模型数量不为一或压缩比异常", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "413": { "description": "压缩包、解压总量或文件数量超过配置上限", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "415": { "description": "Content-Type 不受支持", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/api/v1/health": {
+      "get": {
+        "summary": "转换服务健康与容量（平台调度唯一容量事实来源）",
+        "description": "只读聚合：作业队列计数来自作业仓储，资源压力与 Worker 水位门控共用同一探针；响应不包含宿主机绝对路径。",
+        "responses": {
+          "200": { "description": "健康容量快照", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ConverterHealth" } } } }
+        }
+      }
+    },
+    "/api/v1/upload-sessions": {
+      "post": {
+        "summary": "创建可恢复上传会话（幂等）",
+        "description": "同一 idempotencyKey+sha256 返回原会话；同键不同摘要返回 409。分片固定 64MiB（partSizeBytes 必须为 67108864）。小包同样走本协议，旧 /api/v1/uploads 保留兼容。",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CreateUploadSessionRequest" } } }
+        },
+        "responses": {
+          "201": { "description": "会话已创建（或幂等命中返回原会话）", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UploadSessionResponse" } } } },
+          "400": { "description": "请求字段非法（UPLOAD_PART_INVALID）", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UploadSessionError" } } } },
+          "409": { "description": "幂等键冲突（UPLOAD_SESSION_CONFLICT）", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UploadSessionError" } } } }
+        }
+      }
+    },
+    "/api/v1/upload-sessions/{uploadId}": {
+      "get": {
+        "summary": "查询上传会话（重启恢复与完成轮询）",
+        "parameters": [{ "name": "uploadId", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "responses": {
+          "200": { "description": "会话状态；仅 completed 暴露 inputPath/referenceLlaPath", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UploadSessionResponse" } } } },
+          "404": { "description": "会话不存在或已过期" }
+        }
+      }
+    },
+    "/api/v1/upload-sessions/{uploadId}/parts/{partNumber}": {
+      "put": {
+        "summary": "上传单个分片（二进制正文）",
+        "description": "分片编号从 1 开始；除末片外大小必须为 67108864。要求 Content-Length 与 X-Part-Sha256 头。相同摘要重复上传幂等返回 200，不同摘要返回 409。",
+        "parameters": [
+          { "name": "uploadId", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } },
+          { "name": "partNumber", "in": "path", "required": true, "schema": { "type": "integer", "minimum": 1 } },
+          { "name": "X-Part-Sha256", "in": "header", "required": true, "schema": { "type": "string", "minLength": 64, "maxLength": 64 }, "description": "本分片正文的 SHA-256（小写十六进制）" }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": { "application/octet-stream": { "schema": { "type": "string", "format": "binary" } } }
+        },
+        "responses": {
+          "200": { "description": "分片已接收", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UploadPartResponse" } } } },
+          "400": { "description": "分片非法或摘要不符（UPLOAD_PART_INVALID / UPLOAD_HASH_MISMATCH）", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UploadSessionError" } } } },
+          "404": { "description": "会话不存在或已过期" },
+          "409": { "description": "分片或会话状态冲突（UPLOAD_SESSION_CONFLICT）", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UploadSessionError" } } } }
+        }
+      }
+    },
+    "/api/v1/upload-sessions/{uploadId}/complete": {
+      "post": {
+        "summary": "完成上传（幂等转入 finalizing）",
+        "description": "无请求体。后台有界流式合并分片、校验总大小与整包 SHA-256、安全解压后原子发布；客户端轮询 GET，只有 completed 才能读取 inputPath/referenceLlaPath。",
+        "parameters": [{ "name": "uploadId", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "responses": {
+          "202": { "description": "已转入 finalizing（幂等）", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UploadSessionResponse" } } } },
+          "404": { "description": "会话不存在或已过期" },
+          "409": { "description": "分片未齐或状态不允许（UPLOAD_SESSION_CONFLICT）", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UploadSessionError" } } } }
+        }
+      }
+    },
     "/api/v1/conversions": {
       "post": {
         "summary": "创建转换作业",
@@ -140,6 +233,27 @@
         }
       }
     },
+    "/api/v1/conversions/{id}/result": {
+      "get": {
+        "summary": "按转换 ID 获取完整结果文件清单",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "responses": {
+          "200": { "description": "结果目录清单、单文件地址和整包下载地址", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ConversionResultManifest" } } } },
+          "404": { "description": "作业不存在、尚未成功或结果目录不存在" }
+        }
+      }
+    },
+    "/api/v1/conversions/{id}/result.zip": {
+      "get": {
+        "summary": "按转换 ID 流式下载完整结果 ZIP",
+        "description": "服务边读取 tiles 文件边生成 ZIP，不把完整结果载入内存。",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "responses": {
+          "200": { "description": "完整结果 ZIP", "content": { "application/zip": { "schema": { "type": "string", "format": "binary" } } } },
+          "404": { "description": "作业不存在、尚未成功或结果目录不存在" }
+        }
+      }
+    },
     "/api/v1/conversions/{id}/result/{path}": {
       "get": {
         "summary": "读取成功作业的已发布结果文件（支持 tileset 相对引用）",
@@ -148,14 +262,122 @@
           { "name": "path", "in": "path", "required": true, "schema": { "type": "string" }, "description": "输出目录内相对路径，如 tileset.json、subtrees/region.json、tile.b3dm" }
         ],
         "responses": {
-          "200": { "description": "文件内容；MIME 按扩展名：json/b3dm/glb/jpg/png/webp/ktx2" },
-          "404": { "description": "作业不存在、未成功、文件不存在或路径越界" }
+          "200": { "description": "完整文件内容；MIME 按扩展名：json/b3dm/glb/jpg/png/webp/ktx2", "headers": { "Accept-Ranges": { "schema": { "type": "string" }, "description": "bytes" } } },
+          "206": { "description": "Range 请求的部分内容", "headers": { "Content-Range": { "schema": { "type": "string" }, "description": "bytes start-end/total" }, "Accept-Ranges": { "schema": { "type": "string" }, "description": "bytes" } } },
+          "404": { "description": "作业不存在、未成功、文件不存在或路径越界" },
+          "416": { "description": "Range 越界或不可满足" }
         }
       }
     }
   },
   "components": {
     "schemas": {
+      "ConverterHealth": {
+        "type": "object",
+        "required": ["status", "queueDepth", "runningJobs", "maxConcurrentJobs", "roots", "storage", "resourcePressure", "updatedAt"],
+        "properties": {
+          "status": { "type": "string", "enum": ["ready", "degraded", "not_ready"], "description": "not_ready：执行器或数据目录缺失；degraded：资源压力超软水位或可用空间低于预留；否则 ready" },
+          "queueDepth": { "type": "integer", "description": "排队中作业数" },
+          "runningJobs": { "type": "integer", "description": "运行中（含校验中）作业数" },
+          "maxConcurrentJobs": { "type": "integer" },
+          "roots": {
+            "type": "object",
+            "required": ["inputReady", "outputReady", "stateReady"],
+            "properties": {
+              "inputReady": { "type": "boolean" },
+              "outputReady": { "type": "boolean" },
+              "stateReady": { "type": "boolean" }
+            }
+          },
+          "storage": {
+            "type": "object",
+            "required": ["freeBytes", "reserveBytes"],
+            "properties": {
+              "freeBytes": { "type": "integer", "format": "int64", "description": "状态卷可用空间" },
+              "reserveBytes": { "type": "integer", "format": "int64", "description": "降级预警预留阈值（Conversion:StorageReserveBytes）" }
+            }
+          },
+          "resourcePressure": { "type": "string", "enum": ["normal", "throttled", "blocked"], "description": "与 Worker 内存水位门控同一口径：软水位 throttled，硬水位 blocked" },
+          "updatedAt": { "type": "string", "format": "date-time" }
+        }
+      },
+      "CreateUploadSessionRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["idempotencyKey", "fileName", "sizeBytes", "sha256", "partSizeBytes"],
+        "properties": {
+          "idempotencyKey": { "type": "string", "minLength": 1, "maxLength": 200 },
+          "fileName": { "type": "string", "minLength": 1, "maxLength": 260 },
+          "sizeBytes": { "type": "integer", "format": "int64", "minimum": 1, "description": "ZIP 总字节数；不得超过 Uploads:MaxArchiveBytes" },
+          "sha256": { "type": "string", "minLength": 64, "maxLength": 64, "description": "整包 SHA-256（十六进制）" },
+          "partSizeBytes": { "type": "integer", "format": "int64", "enum": [67108864], "description": "固定 64MiB" }
+        }
+      },
+      "UploadSessionResponse": {
+        "type": "object",
+        "required": ["uploadId", "state", "partSizeBytes", "partCount", "completedParts", "expiresAt", "inputPath", "referenceLlaPath", "errorCode"],
+        "properties": {
+          "uploadId": { "type": "string", "format": "uuid" },
+          "state": { "type": "string", "enum": ["uploading", "finalizing", "completed", "failed", "expired"] },
+          "partSizeBytes": { "type": "integer", "format": "int64" },
+          "partCount": { "type": "integer" },
+          "completedParts": { "type": "array", "items": { "type": "integer" }, "description": "已完成分片号（从 1 开始，升序）" },
+          "expiresAt": { "type": "string", "format": "date-time", "description": "会话过期时间（默认创建后 24 小时，Uploads:SessionTtlHours）" },
+          "inputPath": { "type": "string", "nullable": true, "description": "仅 completed：可直接传给创建转换接口 inputPath 的相对路径" },
+          "referenceLlaPath": { "type": "string", "nullable": true, "description": "仅 completed：包内唯一 reference_lla.json 的相对路径" },
+          "errorCode": { "type": "string", "nullable": true, "enum": ["UPLOAD_SESSION_CONFLICT", "UPLOAD_PART_INVALID", "UPLOAD_HASH_MISMATCH", "UPLOAD_FINALIZE_FAILED"], "description": "仅 failed 有值，其余状态为 null" }
+        }
+      },
+      "UploadPartResponse": {
+        "type": "object",
+        "required": ["partNumber", "sizeBytes", "sha256"],
+        "properties": {
+          "partNumber": { "type": "integer" },
+          "sizeBytes": { "type": "integer", "format": "int64" },
+          "sha256": { "type": "string", "description": "实际落盘分片的 SHA-256（小写十六进制）" }
+        }
+      },
+      "UploadSessionError": {
+        "type": "object",
+        "required": ["errorCode", "message"],
+        "properties": {
+          "errorCode": { "type": "string", "enum": ["UPLOAD_SESSION_CONFLICT", "UPLOAD_PART_INVALID", "UPLOAD_HASH_MISMATCH", "UPLOAD_FINALIZE_FAILED"] },
+          "message": { "type": "string" }
+        }
+      },
+      "ModelUploadResponse": {
+        "type": "object",
+        "required": ["uploadId", "inputPath", "archiveBytes", "extractedBytes", "fileCount"],
+        "properties": {
+          "uploadId": { "type": "string", "format": "uuid" },
+          "inputPath": { "type": "string", "description": "可直接传给创建转换接口 inputPath 的相对路径" },
+          "referenceLlaPath": { "type": "string", "nullable": true, "description": "模型包中唯一 reference_lla.json 的相对路径；没有或存在多个时为 null" },
+          "archiveBytes": { "type": "integer", "format": "int64" },
+          "extractedBytes": { "type": "integer", "format": "int64" },
+          "fileCount": { "type": "integer" }
+        }
+      },
+      "ConversionResultFile": {
+        "type": "object",
+        "required": ["path", "bytes", "sha256", "url"],
+        "properties": {
+          "path": { "type": "string" },
+          "bytes": { "type": "integer", "format": "int64" },
+          "sha256": { "type": "string", "nullable": true, "description": "文件内容 SHA-256（小写十六进制，来自成功前持久化的结果清单）；本功能上线前完成的旧作业回退为 null" },
+          "url": { "type": "string" }
+        }
+      },
+      "ConversionResultManifest": {
+        "type": "object",
+        "required": ["conversionId", "fileCount", "totalBytes", "archiveUrl", "files"],
+        "properties": {
+          "conversionId": { "type": "string", "format": "uuid" },
+          "fileCount": { "type": "integer" },
+          "totalBytes": { "type": "integer", "format": "int64" },
+          "archiveUrl": { "type": "string" },
+          "files": { "type": "array", "items": { "$ref": "#/components/schemas/ConversionResultFile" } }
+        }
+      },
       "CreateConversionRequest": {
         "type": "object",
         "required": ["inputPath"],
@@ -191,14 +413,17 @@
           "externalTilesetDepth": { "type": "integer", "minimum": 0, "maximum": 8 },
           "octree": { "type": "boolean" },
           "divisions": { "type": "integer", "minimum": 0, "maximum": 8 },
-          "zsplit": { "type": "boolean" },
+          "zSplit": { "type": "boolean" },
           "splitStrategy": { "type": "string", "enum": ["AbsoluteCenter", "VertexBaricenter", "VertexMedian"] },
           "lodTextureScale": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 },
-          "maxTextureSize": { "type": "integer", "minimum": 128, "maximum": 8192 },
+          "maxTextureSize": { "type": "integer", "minimum": 128, "maximum": 16384 },
           "textureFormat": { "type": "string", "enum": ["Jpeg", "Webp", "Ktx2"] },
           "textureQuality": { "type": "integer", "minimum": 1, "maximum": 100 },
           "ktx2Quality": { "type": "integer", "minimum": 1, "maximum": 255 },
-          "local": { "type": "boolean" }
+          "local": { "type": "boolean" },
+          "stripDeepBottom": { "type": "boolean" },
+          "deepBottomMinDropMeters": { "type": "number", "minimum": 10, "maximum": 10000 },
+          "deepBottomMarginMeters": { "type": "number", "minimum": 0, "maximum": 1000 }
         }
       },
       "ConversionJobResponse": {

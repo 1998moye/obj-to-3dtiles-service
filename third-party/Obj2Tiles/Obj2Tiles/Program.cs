@@ -51,6 +51,10 @@ namespace Obj2Tiles
             opts.Output = Path.GetFullPath(opts.Output);
             opts.Input = Path.GetFullPath(opts.Input);
 
+            // [2026-09-07 任务级纹理缓存] 一次转换运行一个缓存实例，随运行结束统一释放；
+            // 预算与阶段并发由选项（模型转换服务按资源计划）注入。
+            using var textureCache = new TextureCache(opts.TextureCacheBudgetBytes);
+
             // The output can be a loose folder tree or a single .3tz 3D Tiles Archive. The archive form is
             // selected by a .3tz extension on the output path or by the explicit --3tz flag; in that case the
             // tileset is written to a temporary folder and packed into the archive once tiling completes.
@@ -110,7 +114,14 @@ namespace Obj2Tiles
                         (float)opts.LodTextureScale,
                         opts.MaxTextureSize,
                         opts.TextureQuality,
-                        opts.TextureFormat);
+                        opts.TextureFormat,
+                        textureCache,
+                        opts.StageConcurrency,
+                        opts.HlodSpool,
+                        opts.HlodSpoolDirectory);
+
+                    // 回归指标：驻留网格峰值与暂存磁盘峰值随运行日志输出。
+                    Console.WriteLine($" ?> HLOD frontier: peak resident meshes {hierarchy.PeakResidentMeshes}, spool peak {hierarchy.SpoolPeakBytes} B");
 
                     var hierarchicalGps = opts.Latitude != null && opts.Longitude != null
                         ? new GpsCoords(opts.Latitude.Value, opts.Longitude.Value, opts.Altitude, opts.Scale, opts.YUpToZUp)
@@ -187,7 +198,7 @@ namespace Obj2Tiles
 
                 var boundsMapper = await StagesFacade.Split(decimateRes.DestFiles, destFolderSplit, opts.Divisions,
                     opts.ZSplit, opts.KeepOriginalTextures, opts.SplitPointStrategy, opts.Octree, (float)opts.LodTextureScale,
-                    opts.MaxTextureSize, opts.TextureQuality, opts.TextureFormat);
+                    opts.MaxTextureSize, opts.TextureQuality, opts.TextureFormat, textureCache, opts.StageConcurrency);
 
                 Console.WriteLine(" ?> Splitting stage done in {0}", sw.Elapsed);
 
@@ -240,7 +251,7 @@ namespace Obj2Tiles
                             : rootTextureSizeCap;
                         await StagesFacade.Split(rootSourceObj, rootTempDir, 0,
                             textureDownscale: rootDownscale, maxTextureSize: rootMaxTextureSize, textureQuality: opts.TextureQuality,
-                            textureFormat: opts.TextureFormat);
+                            textureFormat: opts.TextureFormat, textureCache: textureCache, stageConcurrency: opts.StageConcurrency);
                         var compressedRoot = Directory.GetFiles(rootTempDir, "*.obj").FirstOrDefault();
                         if (compressedRoot != null)
                             rootSourceObj = compressedRoot;
@@ -294,7 +305,9 @@ namespace Obj2Tiles
                 // Signal failure to the caller: without a non-zero exit code a failed conversion
                 // (e.g. a missing .mtl dependency) would look successful to batch/CI callers even
                 // though no output was produced.
-                Console.Error.WriteLine(" !> Exception: {0}", ex.Message);
+                // [2026-09-07 失败诊断] 只打印 ex.Message 拿不到异常类型与调用栈（本次真实模型
+                // OutOfMemoryException 无法定位分配点），改为打印完整异常（类型+消息+堆栈）。
+                Console.Error.WriteLine(" !> Exception: {0}", ex);
                 Environment.ExitCode = 1;
             }
             finally
@@ -302,6 +315,11 @@ namespace Obj2Tiles
                 Console.WriteLine();
                 var outcome = Environment.ExitCode == 0 ? "completed" : "failed";
                 Console.WriteLine(" => Pipeline {0} in {1}", outcome, swg.Elapsed);
+
+                // [2026-09-07 缓存可观测] 预算/峰值/解码次数/淘汰次数进入转换日志，
+                // 用于解释内存行为与回归基线对比。
+                Console.WriteLine(" ?> Texture cache: budget {0} B, peak {1} B, loads {2}, evictions {3}",
+                    opts.TextureCacheBudgetBytes, textureCache.PeakBytes, textureCache.LoadCount, textureCache.EvictionCount);
 
                 var tmpFolder = actualTempBase;
 
@@ -461,6 +479,27 @@ namespace Obj2Tiles
             if (opts.Ktx2ZstdLevel > 0 && !opts.Ktx2Uastc)
             {
                 Console.WriteLine(" !> --ktx2-zstd-level requires --ktx2-uastc");
+                return false;
+            }
+
+            // [2026-09-07 资源约束选项校验]
+            if (opts.TextureCacheBudgetBytes < 0)
+            {
+                Console.WriteLine(" !> --texture-cache-budget-bytes must be non-negative (0 disables the budget)");
+                return false;
+            }
+
+            if (opts.StageConcurrency is < 1 or > 8)
+            {
+                Console.WriteLine(" !> --stage-concurrency must be between 1 and 8");
+                return false;
+            }
+
+            // [2026-09-07 HLOD 磁盘暂存] 暂存目录选项必须配合 --hlod-spool 使用，
+            // 避免用户误以为单独指定目录就会启用暂存。
+            if (opts.HlodSpoolDirectory != null && !opts.HlodSpool)
+            {
+                Console.WriteLine(" !> --hlod-spool-dir requires --hlod-spool");
                 return false;
             }
 

@@ -19,7 +19,9 @@ internal static class MeshOptimizerSimplifier
         int InputTriangles,
         int OutputTriangles,
         double TargetError,
-        double ResultError);
+        double ResultError,
+        int SafetyRetries,
+        int SafetyFallbacks);
 
     public static unsafe Result SimplifyFile(string path, double targetError, double targetRatio)
     {
@@ -49,6 +51,8 @@ internal static class MeshOptimizerSimplifier
         var attributes = BuildAttributes(mesh, vertices.Length, out var attributeWeights);
         var outputSubMeshes = new int[sourceSubMeshes.Length][];
         var maximumResultError = 0f;
+        var safetyRetries = 0;
+        var safetyFallbacks = 0;
 
         fixed (float* positionsPtr = positions)
         fixed (float* attributesPtr = attributes)
@@ -64,56 +68,34 @@ internal static class MeshOptimizerSimplifier
                 }
 
                 var sourceIndices = Array.ConvertAll(source, value => checked((uint)value));
-                var destination = new uint[sourceIndices.Length];
                 var targetIndexCount = Math.Max(3, (int)Math.Floor(sourceIndices.Length * targetRatio / 3.0) * 3);
-                float resultError = 0;
-                nuint outputIndexCount;
+                var candidate = SimplifySubMesh(
+                    sourceIndices, targetIndexCount, (float)targetError, positionsPtr, vertices.Length,
+                    attributesPtr, attributes.Length, weightsPtr, attributeWeights.Length, path);
 
-                fixed (uint* sourcePtr = sourceIndices)
-                fixed (uint* destinationPtr = destination)
+                var sourceEnvelope = MeasureTriangleEnvelope(vertices, sourceIndices);
+                if (!IsTriangleEnvelopeSafe(sourceEnvelope, MeasureTriangleEnvelope(vertices, candidate.Indices)))
                 {
-                    if (attributes.Length > 0)
+                    safetyRetries++;
+                    // [2026-09-07 修复 HLOD 跨洞封面] 原代码：简化结果不经几何校验直接写盘。
+                    // 原因：绝对误差只约束表面偏差，不约束新边跨度；开放摄影测量网格会被连接成几十米的大三角形。
+                    // 先提高保留比例并收紧误差重试；仍越过输入三角形包络时仅回退当前材质子网格，保证孔洞不被封死。
+                    var retryIndexCount = Math.Max(targetIndexCount,
+                        (int)Math.Floor(sourceIndices.Length * Math.Max(targetRatio, 0.5) / 3.0) * 3);
+                    candidate = SimplifySubMesh(
+                        sourceIndices, retryIndexCount, (float)(targetError * 0.25), positionsPtr, vertices.Length,
+                        attributesPtr, attributes.Length, weightsPtr, attributeWeights.Length, path);
+                    if (!IsTriangleEnvelopeSafe(sourceEnvelope, MeasureTriangleEnvelope(vertices, candidate.Indices)))
                     {
-                        outputIndexCount = Native.SimplifyWithAttributes(
-                            destinationPtr,
-                            sourcePtr,
-                            (nuint)sourceIndices.Length,
-                            positionsPtr,
-                            (nuint)vertices.Length,
-                            3 * sizeof(float),
-                            attributesPtr,
-                            (nuint)(attributeWeights.Length * sizeof(float)),
-                            weightsPtr,
-                            (nuint)attributeWeights.Length,
-                            null,
-                            (nuint)targetIndexCount,
-                            (float)targetError,
-                            SimplifyLockBorder | SimplifySparse | SimplifyErrorAbsolute,
-                            &resultError);
-                    }
-                    else
-                    {
-                        outputIndexCount = Native.Simplify(
-                            destinationPtr,
-                            sourcePtr,
-                            (nuint)sourceIndices.Length,
-                            positionsPtr,
-                            (nuint)vertices.Length,
-                            3 * sizeof(float),
-                            (nuint)targetIndexCount,
-                            (float)targetError,
-                            SimplifyLockBorder | SimplifySparse | SimplifyErrorAbsolute,
-                            &resultError);
+                        safetyFallbacks++;
+                        candidate = new SimplificationCandidate(sourceIndices, 0);
                     }
                 }
 
-                if (outputIndexCount < 3 || outputIndexCount > (nuint)destination.Length)
-                    throw new InvalidDataException($"meshoptimizer returned an invalid index count for '{path}'.");
-
-                var output = new int[(int)outputIndexCount];
-                for (var i = 0; i < output.Length; i++) output[i] = checked((int)destination[i]);
+                var output = new int[candidate.Indices.Length];
+                for (var i = 0; i < output.Length; i++) output[i] = checked((int)candidate.Indices[i]);
                 outputSubMeshes[subMeshIndex] = output;
-                maximumResultError = Math.Max(maximumResultError, resultError);
+                maximumResultError = Math.Max(maximumResultError, candidate.ResultError);
             }
         }
 
@@ -125,8 +107,116 @@ internal static class MeshOptimizerSimplifier
             inputTriangles,
             outputSubMeshes.Sum(indices => indices.Length / 3),
             targetError,
-            maximumResultError);
+            maximumResultError,
+            safetyRetries,
+            safetyFallbacks);
     }
+
+    private static unsafe SimplificationCandidate SimplifySubMesh(
+        uint[] sourceIndices,
+        int targetIndexCount,
+        float targetError,
+        float* positionsPtr,
+        int vertexCount,
+        float* attributesPtr,
+        int attributesLength,
+        float* weightsPtr,
+        int attributeCount,
+        string path)
+    {
+        var destination = new uint[sourceIndices.Length];
+        float resultError = 0;
+        nuint outputIndexCount;
+        fixed (uint* sourcePtr = sourceIndices)
+        fixed (uint* destinationPtr = destination)
+        {
+            if (attributesLength > 0)
+            {
+                outputIndexCount = Native.SimplifyWithAttributes(
+                    destinationPtr,
+                    sourcePtr,
+                    (nuint)sourceIndices.Length,
+                    positionsPtr,
+                    (nuint)vertexCount,
+                    3 * sizeof(float),
+                    attributesPtr,
+                    (nuint)(attributeCount * sizeof(float)),
+                    weightsPtr,
+                    (nuint)attributeCount,
+                    null,
+                    (nuint)targetIndexCount,
+                    targetError,
+                    SimplifyLockBorder | SimplifySparse | SimplifyErrorAbsolute,
+                    &resultError);
+            }
+            else
+            {
+                outputIndexCount = Native.Simplify(
+                    destinationPtr,
+                    sourcePtr,
+                    (nuint)sourceIndices.Length,
+                    positionsPtr,
+                    (nuint)vertexCount,
+                    3 * sizeof(float),
+                    (nuint)targetIndexCount,
+                    targetError,
+                    SimplifyLockBorder | SimplifySparse | SimplifyErrorAbsolute,
+                    &resultError);
+            }
+        }
+
+        if (outputIndexCount < 3 || outputIndexCount > (nuint)destination.Length)
+            throw new InvalidDataException($"meshoptimizer returned an invalid index count for '{path}'.");
+        Array.Resize(ref destination, checked((int)outputIndexCount));
+        return new SimplificationCandidate(destination, resultError);
+    }
+
+    private static TriangleEnvelope MeasureTriangleEnvelope(Vector3d[] vertices, IReadOnlyList<uint> indices)
+    {
+        var maximumEdgeSquared = 0d;
+        var maximumDoubleAreaSquared = 0d;
+        for (var i = 0; i + 2 < indices.Count; i += 3)
+        {
+            var a = vertices[indices[i]];
+            var b = vertices[indices[i + 1]];
+            var c = vertices[indices[i + 2]];
+            maximumEdgeSquared = Math.Max(maximumEdgeSquared, Math.Max(
+                SquaredDistance(a, b), Math.Max(SquaredDistance(b, c), SquaredDistance(c, a))));
+
+            var abX = b.x - a.x;
+            var abY = b.y - a.y;
+            var abZ = b.z - a.z;
+            var acX = c.x - a.x;
+            var acY = c.y - a.y;
+            var acZ = c.z - a.z;
+            var crossX = abY * acZ - abZ * acY;
+            var crossY = abZ * acX - abX * acZ;
+            var crossZ = abX * acY - abY * acX;
+            maximumDoubleAreaSquared = Math.Max(maximumDoubleAreaSquared,
+                crossX * crossX + crossY * crossY + crossZ * crossZ);
+        }
+        return new TriangleEnvelope(maximumEdgeSquared, maximumDoubleAreaSquared);
+    }
+
+    private static double SquaredDistance(Vector3d a, Vector3d b)
+    {
+        var x = b.x - a.x;
+        var y = b.y - a.y;
+        var z = b.z - a.z;
+        return x * x + y * y + z * z;
+    }
+
+    private static bool IsTriangleEnvelopeSafe(TriangleEnvelope source, TriangleEnvelope candidate)
+    {
+        // 面积比使用“二倍面积的平方”，所以 1.5 倍面积对应 2.25 倍平方值。
+        const double maximumEdgeGrowthSquared = 1.25 * 1.25;
+        const double maximumAreaGrowthSquared = 1.5 * 1.5;
+        return candidate.MaximumEdgeSquared <= source.MaximumEdgeSquared * maximumEdgeGrowthSquared + 1e-9 &&
+               candidate.MaximumDoubleAreaSquared <= source.MaximumDoubleAreaSquared * maximumAreaGrowthSquared + 1e-9;
+    }
+
+    private sealed record SimplificationCandidate(uint[] Indices, float ResultError);
+    private sealed record TriangleEnvelope(double MaximumEdgeSquared, double MaximumDoubleAreaSquared);
 
     private static float[] BuildAttributes(ObjMesh mesh, int vertexCount, out float[] weights)
     {

@@ -106,6 +106,23 @@ public sealed class Options
     [Option("ktx-path", Required = false, HelpText = "Explicit path to the libktx native library (ktx.dll / libktx.so / libktx.dylib) or the directory containing it, used for --texture-format Ktx2. When omitted it is resolved from the OBJ2TILES_KTX environment variable, next to the executable (bundled), or on the system library path.", Default = null)]
     public string? KtxPath { get; set; }
 
+    // [2026-09-07 任务级纹理缓存] 纹理解码缓存的字节预算（按解码后 RGBA 计）；
+    // 0 表示不设上限（保持旧行为）。模型转换服务按资源计划传入。
+    [Option("texture-cache-budget-bytes", Required = false, HelpText = "Byte budget for the decoded-texture LRU cache (decoded RGBA bytes). 0 disables the budget.", Default = 1L << 30)]
+    public long TextureCacheBudgetBytes { get; set; }
+
+    // [2026-09-07 阶段并发] 纹理解码、图集构建/编码与 LOD 处理的并发上限；默认 1（最省内存）。
+    [Option("stage-concurrency", Required = false, HelpText = "Max concurrency for texture decode / atlas build & encode / LOD processing stages. 1 (default) minimizes peak memory.", Default = 1)]
+    public int StageConcurrency { get; set; }
+
+    // [2026-09-07 HLOD 磁盘暂存] 极低内存档位启用：HLOD 中间网格暂存到任务专属磁盘目录，
+    // 处理时读回（读回即删），把同时驻留内存的网格数降到 O(1)。仅 hierarchical 管线使用。
+    [Option("hlod-spool", Required = false, HelpText = "Spool HLOD intermediate meshes to a task-local disk directory instead of keeping them resident. Only used by the hierarchical pipeline.", Default = false)]
+    public bool HlodSpool { get; set; }
+
+    [Option("hlod-spool-dir", Required = false, HelpText = "Directory for --hlod-spool intermediates. Defaults to a .hlod-spool folder inside the HLOD working directory.", Default = null)]
+    public string? HlodSpoolDirectory { get; set; }
+
     [Option("3tz", Required = false, HelpText = "Produce a single 3D Tiles Archive (.3tz) instead of a loose folder tree. Also enabled automatically when the output path ends with .3tz.", Default = false)]
     public bool ThreeTz { get; set; }
 

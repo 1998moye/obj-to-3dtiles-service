@@ -1,3 +1,4 @@
+using Microsoft.AspNetCore.Http.Features;
 using ModelConversion.Service.Application;
 using ModelConversion.Service.Configuration;
 using ModelConversion.Service.Domain;
@@ -17,6 +18,8 @@ public static class ConversionEndpoints
         group.MapGet("/{id:guid}/progress", GetProgressAsync);
         group.MapPost("/{id:guid}/cancel", CancelAsync);
         group.MapPost("/{id:guid}/retry", RetryAsync);
+        group.MapGet("/{id:guid}/result", GetResultManifestAsync);
+        group.MapGet("/{id:guid}/result.zip", DownloadResultArchiveAsync);
         group.MapGet("/{id:guid}/result/{**path}", GetResultAsync);
         return endpoints;
     }
@@ -130,9 +133,48 @@ public static class ConversionEndpoints
         }
     }
 
+    private static async Task<IResult> GetResultManifestAsync(
+        Guid id,
+        ConversionResultService resultService,
+        ResultReadLeaseRegistry leaseRegistry,
+        CancellationToken cancellationToken)
+    {
+        var snapshot = await resultService.GetAsync(id, cancellationToken);
+        if (snapshot == null) return Results.NotFound();
+
+        return new LeasedResult(id, leaseRegistry, Results.Ok(new
+        {
+            conversionId = id,
+            fileCount = snapshot.Files.Count,
+            totalBytes = snapshot.TotalBytes,
+            archiveUrl = $"/api/v1/conversions/{id}/result.zip",
+            files = snapshot.Files.Select(file => new
+            {
+                path = file.Path,
+                bytes = file.Bytes,
+                // [2026-09-09 Issue01 结果清单] SHA-256 来自成功前持久化的清单；旧数据回退时可能为 null
+                sha256 = file.Sha256,
+                url = $"/api/v1/conversions/{id}/result/{EncodeRelativeUrl(file.Path)}"
+            })
+        }));
+    }
+
+    private static async Task<IResult> DownloadResultArchiveAsync(
+        Guid id,
+        ConversionResultService resultService,
+        ResultReadLeaseRegistry leaseRegistry,
+        CancellationToken cancellationToken)
+    {
+        var snapshot = await resultService.GetAsync(id, cancellationToken);
+        return snapshot == null
+            ? Results.NotFound()
+            : new ConversionResultArchive(id, snapshot, resultService, leaseRegistry);
+    }
+
     // 结果读取授权来自“成功作业 + 该作业已发布输出根”，不暴露整个 OutputRoot。
     private static async Task<IResult> GetResultAsync(
-        Guid id, string? path, ConversionJobService service, ConversionOptions options, CancellationToken cancellationToken)
+        Guid id, string? path, ConversionJobService service, ConversionOptions options,
+        ResultReadLeaseRegistry leaseRegistry, CancellationToken cancellationToken)
     {
         var job = await service.GetAsync(id, cancellationToken);
         if (job == null || job.State != ConversionJobState.Succeeded || string.IsNullOrEmpty(path))
@@ -149,7 +191,11 @@ public static class ConversionEndpoints
             return Results.NotFound();
         }
         if (!File.Exists(filePath)) return Results.NotFound();
-        return Results.File(filePath, ResultContentType(filePath));
+        // [2026-09-09 Issue01 Range 下载] 原代码: Results.File(filePath, contentType) 不支持 Range。
+        // 原因: 平台按 manifest 断点续传需要 206/Content-Range；越界 Range 由框架稳定拒绝（416）。
+        // 响应全程持有读租约，终态清理不得删除正在下载的作业产物。
+        return new LeasedResult(id, leaseRegistry,
+            Results.File(filePath, ResultContentType(filePath), enableRangeProcessing: true));
     }
 
     private static string ResultContentType(string path) => Path.GetExtension(path).ToLowerInvariant() switch
@@ -163,4 +209,39 @@ public static class ConversionEndpoints
         ".ktx2" => "image/ktx2",
         _ => "application/octet-stream"
     };
+
+    private static string EncodeRelativeUrl(string path) => string.Join('/',
+        path.Split('/', StringSplitOptions.RemoveEmptyEntries).Select(Uri.EscapeDataString));
+
+    private sealed class ConversionResultArchive(
+        Guid conversionId,
+        ConversionResultSnapshot snapshot,
+        ConversionResultService resultService,
+        ResultReadLeaseRegistry leaseRegistry) : IResult
+    {
+        public async Task ExecuteAsync(HttpContext httpContext)
+        {
+            // [2026-09-08 结果目录拉取] ZipArchive 关闭时同步写少量中央目录元数据；文件正文仍全部异步流式传输。
+            var bodyControl = httpContext.Features.Get<IHttpBodyControlFeature>();
+            if (bodyControl != null) bodyControl.AllowSynchronousIO = true;
+            httpContext.Response.StatusCode = StatusCodes.Status200OK;
+            httpContext.Response.ContentType = "application/zip";
+            httpContext.Response.Headers.ContentDisposition =
+                $"attachment; filename=conversion-{snapshot.ConversionId:N}.zip";
+            // [2026-09-09 Issue01 结果读取租约] 整包下载可能持续很久，全程持有租约防止终态清理误删。
+            using var lease = leaseRegistry.Acquire(conversionId);
+            await resultService.WriteZipAsync(snapshot, httpContext.Response.Body, httpContext.RequestAborted);
+        }
+    }
+
+    // [2026-09-09 Issue01 结果读取租约] 结果响应统一入口：进入时向 ResultReadLeaseRegistry 登记，
+    // 响应结束（含 Range 分段下载）后释放；进程退出即终止在途响应，重启后无虚假租约。
+    private sealed class LeasedResult(Guid jobId, ResultReadLeaseRegistry leaseRegistry, IResult inner) : IResult
+    {
+        public async Task ExecuteAsync(HttpContext httpContext)
+        {
+            using var lease = leaseRegistry.Acquire(jobId);
+            await inner.ExecuteAsync(httpContext);
+        }
+    }
 }

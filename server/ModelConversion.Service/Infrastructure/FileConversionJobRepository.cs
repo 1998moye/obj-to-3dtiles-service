@@ -77,5 +77,21 @@ public sealed class FileConversionJobRepository : IConversionJobRepository
         }
     }
 
+    // [2026-09-09 Issue01 终态清理] 与 Save/Get 同闸门，删除不存在的文件视为成功（幂等重试）。
+    public async Task DeleteAsync(Guid id, CancellationToken cancellationToken)
+    {
+        await _gate.WaitAsync(cancellationToken);
+        try
+        {
+            var path = GetPath(id);
+            if (File.Exists(path)) File.Delete(path);
+        }
+        finally
+        {
+            _gate.Release();
+        }
+        await Task.CompletedTask;
+    }
+
     private string GetPath(Guid id) => Path.Combine(_jobsRoot, id.ToString("N") + ".json");
 }

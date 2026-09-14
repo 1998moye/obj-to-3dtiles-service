@@ -42,4 +42,7 @@ public sealed class ConversionProgressRegistry(TimeProvider timeProvider)
         var percent = stage == ConversionProgressStage.Completed ? 100 : current.Percent;
         return Report(job.Id, new ConversionProgressUpdate(percent, stage, message));
     }
+
+    // [2026-09-09 Issue01 终态清理] 作业状态文件被 TTL 清理后同步逐出内存进度，避免残留。
+    public void Remove(Guid jobId) => _progress.TryRemove(jobId, out _);
 }

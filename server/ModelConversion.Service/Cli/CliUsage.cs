@@ -56,13 +56,19 @@ public static class CliUsage
               --zsplit <true|false>
               --split-strategy <AbsoluteCenter|VertexBaricenter|VertexMedian>
               --lod-texture-scale <(0,1]>
-              --max-texture-size <128-8192>
+              --max-texture-size <128-16384>
               --texture-format <Jpeg|Webp|Ktx2>
               --texture-quality <1-100>
               --ktx2-quality <1-255>
+              --strip-deep-bottom <true|false>   剥离深层封底几何（默认 true）；
+                                           摄影测量封洞产生的地下几何会渲染成灰色块并带偏高度回正
+              --deep-bottom-min-drop <10-10000>  判定存在封底的最小落差（米，默认 100）
+              --deep-bottom-margin <0-1000>      剥离阈值向下余量（米，默认 2）
 
             退出码:
-              0 成功 | 2 参数/输入错误 | 3 输出冲突 | 4 转换失败或超时 | 5 tileset 校验失败 | 130 用户取消
+              0 成功 | 2 参数/输入错误 | 3 输出冲突 | 4 转换失败或超时 | 5 tileset 校验失败
+              6 资源准入拒绝（内存档位不足/极低内存准入失败/硬性输入上限/主动内存保护）
+              7 临时磁盘预算不足 | 130 用户取消
 
             示例:
               convert --input D:\models\obj1 --output D:\tiles\obj1 --profile industrial-jpeg --reference-lla D:\models\obj1\reference_lla.json

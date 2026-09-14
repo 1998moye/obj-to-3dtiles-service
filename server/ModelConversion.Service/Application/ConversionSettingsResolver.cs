@@ -26,7 +26,10 @@ public sealed class ConversionSettingsResolver(ConversionOptions options)
             TextureFormat = overrides?.TextureFormat ?? ParseEnum<ConversionTextureFormat>(profile.TextureFormat, profileName),
             TextureQuality = overrides?.TextureQuality ?? profile.TextureQuality,
             Ktx2Quality = overrides?.Ktx2Quality ?? profile.Ktx2Quality,
-            Local = overrides?.Local ?? profile.Local
+            Local = overrides?.Local ?? profile.Local,
+            StripDeepBottom = overrides?.StripDeepBottom ?? profile.StripDeepBottom,
+            DeepBottomMinDropMeters = overrides?.DeepBottomMinDropMeters ?? profile.DeepBottomMinDropMeters,
+            DeepBottomMarginMeters = overrides?.DeepBottomMarginMeters ?? profile.DeepBottomMarginMeters
         };
         settings.EnsureValid();
         return settings;

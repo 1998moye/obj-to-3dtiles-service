@@ -1,6 +1,7 @@
 using ModelConversion.Service.Configuration;
 using ModelConversion.Service.Domain;
 using ModelConversion.Service.Infrastructure;
+using ModelConversion.Service.Infrastructure.Resources;
 
 namespace ModelConversion.Service.Application;
 
@@ -11,7 +12,9 @@ public sealed class ConversionWorker(
     ConversionProgressRegistry progressRegistry,
     IConversionRunner runner,
     ConversionSettingsResolver settingsResolver,
+    ConversionResultManifestService resultManifestService,
     ConversionOptions options,
+    IRuntimeResourceProbe resourceProbe,
     TimeProvider timeProvider,
     ILogger<ConversionWorker> logger) : BackgroundService
 {
@@ -66,6 +69,27 @@ public sealed class ConversionWorker(
         var stagingOutput = PathBoundary.ResolveOwnedPath(options.StateRoot, Path.Combine("work", job.Id.ToString("N")));
         var logPath = PathBoundary.ResolveOwnedPath(options.StateRoot, Path.Combine("logs", job.Id.ToString("N") + ".log"));
 
+        // [2026-09-07 软水位门控] 容器内存用量达到软水位时暂停启动新的重型转换，
+        // 等待回落后重新排队，避免瞬时峰值突破容器限制。
+        // 仅容器限制（cgroup v1/v2）下强制：进程回退口径读到的是整机内存，
+        // 无法区分本服务与其他进程占用，强制会把高负载开发机上的任务误判为永远不可启动。
+        var gate = resourceProbe.Snapshot(options.StateRoot);
+        if (gate.MemorySource != MemoryLimitSource.ProcessFallback
+            && gate.MemoryCurrentBytes is { } current
+            && current > gate.MemoryLimitBytes * options.Resources.SoftWatermarkRatio)
+        {
+            logger.LogWarning(
+                "转换任务 {JobId} 延迟启动：内存用量 {Current} 超过软水位 {SoftWatermark}",
+                job.Id,
+                ConversionResourceReport.FormatBytes(current),
+                ConversionResourceReport.FormatBytes((long)(gate.MemoryLimitBytes * options.Resources.SoftWatermarkRatio)));
+            progressRegistry.Report(job.Id,
+                new ConversionProgressUpdate(0, ConversionProgressStage.Queued, "内存达到软水位，等待资源回落"));
+            await Task.Delay(TimeSpan.FromSeconds(options.Resources.SoftWatermarkRetrySeconds), stoppingToken);
+            await queue.EnqueueAsync(jobId, stoppingToken);
+            return;
+        }
+
         job = job.TransitionTo(ConversionJobState.Running, timeProvider.GetUtcNow());
         await repository.SaveAsync(job, stoppingToken);
         progressRegistry.Report(job.Id,
@@ -90,6 +114,24 @@ public sealed class ConversionWorker(
                         diagnostic: result.ReusedExistingOutput ? "检测到已发布输出，执行幂等复核" : null,
                         exitCode: result.ExitCode);
                     await repository.SaveAsync(validating, stoppingToken);
+                    // [2026-09-09 Issue01 结果清单] 宣布成功前流式生成并原子持久化结果 manifest
+                    // （每文件 路径/字节数/SHA-256）；幂等复核路径共用同一补建逻辑。
+                    // 清单生成失败按作业失败处理：平台归档依赖 SHA 校验，无清单的成功没有意义。
+                    try
+                    {
+                        await resultManifestService.EnsureAsync(job.Id, finalOutput, stoppingToken);
+                    }
+                    catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                    {
+                        // 停机：保持 Validating，下一次启动恢复排队后复核并补建清单。
+                        return;
+                    }
+                    catch (Exception manifestException)
+                    {
+                        logger.LogError(manifestException, "转换任务 {JobId} 结果清单生成失败", job.Id);
+                        await MarkFailedAsync(validating, $"结果清单生成失败: {manifestException.Message}");
+                        return;
+                    }
                     job = validating.TransitionTo(ConversionJobState.Succeeded, timeProvider.GetUtcNow(), validation: result.Validation);
                     await repository.SaveAsync(job, stoppingToken);
                     progressRegistry.MarkTerminal(job, ConversionProgressStage.Completed, "转换完成");

@@ -8,7 +8,8 @@ public sealed record ConverterCommand(string Executable, IReadOnlyList<string> A
 
 public sealed class Obj2TilesCommandBuilder(ConversionOptions options)
 {
-    public ConverterCommand Build(string inputPath, string outputPath, ConversionSettings settings, GeoReference? geoReference)
+    public ConverterCommand Build(string inputPath, string outputPath, ConversionSettings settings, GeoReference? geoReference,
+        ConversionResourcePlan? resourcePlan = null)
     {
         settings.EnsureValid();
         if (!settings.Local && geoReference == null)
@@ -26,6 +27,16 @@ public sealed class Obj2TilesCommandBuilder(ConversionOptions options)
             "--texture-format", settings.TextureFormat.ToString()
         };
 
+        // [2026-09-07 资源计划下发] 纹理缓存预算与阶段并发由资源计划决定，
+        // 让 Obj2Tiles 内部的解码/图集/LOD 并发受同一套预算约束。
+        if (resourcePlan != null)
+        {
+            args.Add("--texture-cache-budget-bytes");
+            args.Add(resourcePlan.TextureCacheBudgetBytes.ToString(CultureInfo.InvariantCulture));
+            args.Add("--stage-concurrency");
+            args.Add(resourcePlan.MaxStageConcurrency.ToString(CultureInfo.InvariantCulture));
+        }
+
         if (settings.Hierarchical)
         {
             args.Add("--hierarchical");
@@ -34,6 +45,10 @@ public sealed class Obj2TilesCommandBuilder(ConversionOptions options)
                 "--hlod-target-ratio", settings.HlodTargetRatio.ToString(CultureInfo.InvariantCulture),
                 "--external-tileset-depth", settings.ExternalTilesetDepth.ToString(CultureInfo.InvariantCulture)
             ]);
+            // [2026-09-07 HLOD 磁盘暂存] 极低内存档位把 HLOD 中间网格暂存到任务磁盘，
+            // 用磁盘换驻留内存；暂存目录默认在 HLOD 工作目录内，随任务暂存区一并清理。
+            if (resourcePlan?.Mode == ConversionMemoryMode.VeryLowMemory)
+                args.Add("--hlod-spool");
         }
         else if (settings.Octree) args.Add("--octree");
         if (settings.ZSplit) args.Add("--zsplit");

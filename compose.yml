@@ -1,27 +1,59 @@
 services:
+  # 仅初始化宿主机数据目录权限；正式服务仍以镜像内非 root 用户运行。
+  volume-init:
+    image: ${MODEL_CONVERSION_IMAGE:-dz98/model-conversion-service:v3.1}
+    # v3.1 当前作为持续发布标签；每次启动前检查远端，避免已有旧镜像时静默跳过更新。
+    pull_policy: always
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        runtime_uid="$${APP_UID:-1654}"
+        mkdir -p /data/obj2tiles/input /data/obj2tiles/output /data/obj2tiles/state
+        chown "$${runtime_uid}:$${runtime_uid}" \
+          /data/obj2tiles/input /data/obj2tiles/output /data/obj2tiles/state
+        chown -R "$${runtime_uid}:$${runtime_uid}" /data/obj2tiles/state
+        chmod 0755 /data/obj2tiles/input /data/obj2tiles/output /data/obj2tiles/state
+    volumes:
+      - type: bind
+        # Windows 默认 %USERPROFILE%/model-conversion-service-data；Linux 默认 /var/lib/model-conversion-service-data。
+        # MODEL_CONVERSION_DATA_ROOT 非空时优先使用调用方指定的绝对路径。
+        source: ${MODEL_CONVERSION_DATA_ROOT:-${USERPROFILE:-/var/lib}/model-conversion-service-data}
+        target: /data/obj2tiles
+        bind:
+          create_host_path: true
+          selinux: z
+    restart: "no"
+
   model-conversion-service:
-    build:
-      context: .
-    image: model-conversion-service:local
+    image: ${MODEL_CONVERSION_IMAGE:-dz98/model-conversion-service:v3.1}
+    pull_policy: always
     restart: unless-stopped
+    depends_on:
+      volume-init:
+        condition: service_completed_successfully
     ports:
-      - "8091:8080"
+      - "${MODEL_CONVERSION_PORT:-8091}:8080"
     environment:
+      Conversion__InputRoot: /data/obj2tiles/input
+      Conversion__OutputRoot: /data/obj2tiles/output
+      Conversion__StateRoot: /data/obj2tiles/state
       Conversion__MaxConcurrentJobs: "1"
       Conversion__JobTimeoutMinutes: "720"
     volumes:
-      # 输入卷只读；输出与状态各自持久化，重启后作业状态可恢复。
-      - ./data/input:/data/input:ro
-      - ./data/output:/data/output
-      - ./data/state:/data/state
+      - type: bind
+        source: ${MODEL_CONVERSION_DATA_ROOT:-${USERPROFILE:-/var/lib}/model-conversion-service-data}
+        target: /data/obj2tiles
+        bind:
+          create_host_path: true
+          selinux: z
     healthcheck:
       test: ["CMD", "dotnet", "/app/health/HealthProbe.dll"]
       interval: 30s
       timeout: 5s
       start_period: 20s
       retries: 3
-    deploy:
-      resources:
-        limits:
-          cpus: "8"
-          memory: 24G
+
+    # 不固定 24G cgroup 上限：让服务按部署机器实际可见内存自动选择 2G/4G/高内存档位。
+    # 共享宿主机如需硬隔离，可在 compose.override.yml 中为本服务增加 resources.limits。
